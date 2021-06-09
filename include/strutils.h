@@ -8,6 +8,9 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <errno.h>
+#include <time.h>
+
+#include "c.h"
 
 /* initialize a custom exit code for all *_or_err functions */
 extern void strutils_set_exitcode(int exit_code);
@@ -29,12 +32,14 @@ extern uint64_t strtou64_or_err(const char *str, const char *errmesg);
 extern uint64_t strtox64_or_err(const char *str, const char *errmesg);
 
 extern double strtod_or_err(const char *str, const char *errmesg);
+extern long double strtold_or_err(const char *str, const char *errmesg);
 
 extern long strtol_or_err(const char *str, const char *errmesg);
 extern unsigned long strtoul_or_err(const char *str, const char *errmesg);
 
 extern void strtotimeval_or_err(const char *str, struct timeval *tv,
 		const char *errmesg);
+extern time_t strtotime_or_err(const char *str, const char *errmesg);
 
 extern int isdigit_strend(const char *str, const char **end);
 #define isdigit_string(_s)	isdigit_strend(_s, NULL)
@@ -61,8 +66,13 @@ extern char *strnchr(const char *s, size_t maxlen, int c);
 /* caller guarantees n > 0 */
 static inline void xstrncpy(char *dest, const char *src, size_t n)
 {
-	strncpy(dest, src, n-1);
-	dest[n-1] = 0;
+	size_t len = src ? strlen(src) : 0;
+
+	if (!len)
+		return;
+	len = min(len, n - 1);
+	memcpy(dest, src, len);
+	dest[len] = 0;
 }
 
 /* This is like strncpy(), but based on memcpy(), so compilers and static
@@ -309,6 +319,33 @@ static inline size_t ltrim_whitespace(unsigned char *str)
 	return len;
 }
 
+/* Removes left-hand, right-hand and repeating whitespaces.
+ */
+static inline size_t normalize_whitespace(unsigned char *str)
+{
+	size_t i, x, sz = strlen((char *) str);
+	int nsp = 0, intext = 0;
+
+	if (!sz)
+		return 0;
+
+	for (i = 0, x = 0; i < sz; ) {
+		if (isspace(str[i]))
+			nsp++;
+		else
+			nsp = 0, intext = 1;
+
+		if (nsp > 1 || (nsp && !intext))
+			i++;
+		else
+			str[x++] = str[i++];
+	}
+	if (nsp)		/* tailing space */
+		x--;
+	str[x] = '\0';
+	return x;
+}
+
 static inline void strrep(char *s, int find, int replace)
 {
 	while (s && *s && (s = strchr(s, find)) != NULL)
@@ -335,5 +372,6 @@ extern char *strfappend(const char *s, const char *format, ...)
 extern const char *split(const char **state, size_t *l, const char *separator, int quoted);
 
 extern int skip_fline(FILE *fp);
+extern int ul_stralnumcmp(const char *p1, const char *p2);
 
 #endif

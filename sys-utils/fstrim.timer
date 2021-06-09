@@ -1,8 +1,8 @@
 [Unit]
 Description=Discard unused blocks once a week
 Documentation=man:fstrim
-ConditionPathExists=/etc/fstab
 ConditionVirtualization=!container
+ConditionPathExists=!/etc/initrd-release
 
 [Timer]
 OnCalendar=weekly

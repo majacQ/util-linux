@@ -10,6 +10,7 @@
 #include "mangle.h"
 #include "path.h"
 #include "nls.h"
+#include "strutils.h"
 
 #include "lsblk.h"
 
@@ -104,7 +105,9 @@ static struct lsblk_devprop *get_properties_by_udev(struct lsblk_device *ld)
 		if (data)
 			prop->wwn = xstrdup(data);
 
-		data = udev_device_get_property_value(dev, "ID_SCSI_SERIAL");
+		data = udev_device_get_property_value(dev, "SCSI_IDENT_SERIAL");	/* sg3_utils do not use I_D prefix */
+		if (!data)
+			data = udev_device_get_property_value(dev, "ID_SCSI_SERIAL");
 		if(!data)
 			data = udev_device_get_property_value(dev, "ID_SERIAL_SHORT");
 		if(!data)
@@ -112,7 +115,11 @@ static struct lsblk_devprop *get_properties_by_udev(struct lsblk_device *ld)
 		if (data)
 			prop->serial = xstrdup(data);
 
-		if ((data = udev_device_get_property_value(dev, "ID_MODEL")))
+		if ((data = udev_device_get_property_value(dev, "ID_MODEL_ENC"))) {
+			prop->model = xstrdup(data);
+			unhexmangle_string(prop->model);
+			normalize_whitespace((unsigned char *) prop->model);
+		} else if ((data = udev_device_get_property_value(dev, "ID_MODEL")))
 			prop->model = xstrdup(data);
 
 		udev_device_unref(dev);
@@ -209,6 +216,7 @@ static struct lsblk_devprop *get_properties_by_file(struct lsblk_device *ld)
 		else if (lookup(buf, "ID_MODEL", &prop->model)) ;
 		else if (lookup(buf, "ID_WWN_WITH_EXTENSION", &prop->wwn)) ;
 		else if (lookup(buf, "ID_WWN", &prop->wwn)) ;
+		else if (lookup(buf, "SCSI_IDENT_SERIAL", &prop->serial)) ;	/* serial from sg3_utils */
 		else if (lookup(buf, "ID_SCSI_SERIAL", &prop->serial)) ;
 		else if (lookup(buf, "ID_SERIAL_SHORT", &prop->serial)) ;
 		else if (lookup(buf, "ID_SERIAL", &prop->serial)) ;

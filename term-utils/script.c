@@ -300,13 +300,14 @@ static int log_close(struct script_control *ctl,
 	}
 	case SCRIPT_FMT_TIMING_MULTI:
 	{
-		struct timeval now, delta;
+		struct timeval now = { 0 }, delta = { 0 };
 
 		gettime_monotonic(&now);
 		timersub(&now, &log->starttime, &delta);
 
-		log_info(ctl, "DURATION", "%ld.%06ld",
-			(long)delta.tv_sec, (long)delta.tv_usec);
+		log_info(ctl, "DURATION", "%"PRId64".%06"PRId64,
+			(int64_t)delta.tv_sec,
+			(int64_t)delta.tv_usec);
 		log_info(ctl, "EXIT_CODE", "%d", status);
 		break;
 	}
@@ -469,8 +470,8 @@ static ssize_t log_write(struct script_control *ctl,
 
 		gettime_monotonic(&now);
 		timersub(&now, &log->oldtime, &delta);
-		ssz = fprintf(log->fp, "%ld.%06ld %zd\n",
-			(long)delta.tv_sec, (long)delta.tv_usec, bytes);
+		ssz = fprintf(log->fp, "%"PRId64".%06"PRId64" %zd\n",
+			(int64_t)delta.tv_sec, (int64_t)delta.tv_usec, bytes);
 		if (ssz < 0)
 			return -errno;
 
@@ -482,9 +483,9 @@ static ssize_t log_write(struct script_control *ctl,
 
 		gettime_monotonic(&now);
 		timersub(&now, &log->oldtime, &delta);
-		ssz = fprintf(log->fp, "%c %ld.%06ld %zd\n",
+		ssz = fprintf(log->fp, "%c %"PRId64".%06"PRId64" %zd\n",
 			stream->ident,
-			(long)delta.tv_sec, (long)delta.tv_usec, bytes);
+			(int64_t)delta.tv_sec, (int64_t)delta.tv_usec, bytes);
 		if (ssz < 0)
 			return -errno;
 
@@ -548,12 +549,12 @@ static ssize_t log_signal(struct script_control *ctl, int signum, char *msgfmt, 
 	}
 
 	if (*msg)
-		sz = fprintf(log->fp, "S %ld.%06ld SIG%s %s\n",
-			(long)delta.tv_sec, (long)delta.tv_usec,
+		sz = fprintf(log->fp, "S %"PRId64".%06"PRId64" SIG%s %s\n",
+			(int64_t)delta.tv_sec, (int64_t)delta.tv_usec,
 			signum_to_signame(signum), msg);
 	else
-		sz = fprintf(log->fp, "S %ld.%06ld SIG%s\n",
-			(long)delta.tv_sec, (long)delta.tv_usec,
+		sz = fprintf(log->fp, "S %"PRId64".%06"PRId64" SIG%s\n",
+			(int64_t)delta.tv_sec, (int64_t)delta.tv_usec,
 			signum_to_signame(signum));
 
 	log->oldtime = now;
@@ -672,7 +673,6 @@ static int callback_log_stream_activity(void *data, int fd, char *buf, size_t bu
 				ctl->outsz, ctl->maxsz));
 
 	ctl->outsz += ssz;
-
 
 	/* check output limit */
 	if (ctl->maxsz != 0 && ctl->outsz >= ctl->maxsz) {
@@ -968,14 +968,14 @@ int main(int argc, char **argv)
 
 		if (access(shell, X_OK) == 0) {
 			if (command)
-				execl(shell, shname, "-c", command, NULL);
+				execl(shell, shname, "-c", command, (char *)NULL);
 			else
-				execl(shell, shname, "-i", NULL);
+				execl(shell, shname, "-i", (char *)NULL);
 		} else {
 			if (command)
-				execlp(shname, "-c", command, NULL);
+				execlp(shname, "-c", command, (char *)NULL);
 			else
-				execlp(shname, "-i", NULL);
+				execlp(shname, "-i", (char *)NULL);
 		}
 
 		err(EXIT_FAILURE, "failed to execute %s", shell);
@@ -1007,14 +1007,14 @@ int main(int argc, char **argv)
 			log_info(&ctl, "COLUMNS", "%d", ctl.ttycols);
 			log_info(&ctl, "LINES", "%d", ctl.ttylines);
 		}
-		log_info(&ctl, "SHELL", shell);
+		log_info(&ctl, "SHELL", "%s", shell);
 		if (command)
-			log_info(&ctl, "COMMAND", command);
-		log_info(&ctl, "TIMING_LOG", timingfile);
+			log_info(&ctl, "COMMAND", "%s", command);
+		log_info(&ctl, "TIMING_LOG", "%s", timingfile);
 		if (outfile)
-			log_info(&ctl, "OUTPUT_LOG", outfile);
+			log_info(&ctl, "OUTPUT_LOG", "%s", outfile);
 		if (infile)
-			log_info(&ctl, "INPUT_LOG", infile);
+			log_info(&ctl, "INPUT_LOG", "%s", infile);
 	}
 
         /* this is the main loop */

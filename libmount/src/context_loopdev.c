@@ -62,7 +62,7 @@ int mnt_context_is_loopdev(struct libmnt_context *cxt)
 	 */
 	type = mnt_fs_get_fstype(cxt->fs);
 
-	if (mnt_fs_is_regular(cxt->fs) &&
+	if (mnt_fs_is_regularfs(cxt->fs) &&
 	    (!type || strcmp(type, "auto") == 0 || blkid_known_fstype(type))) {
 		struct stat st;
 
@@ -250,7 +250,7 @@ int mnt_context_setup_loopdev(struct libmnt_context *cxt)
 
 		case 2: /* overlap -- full size and offset match (reuse) */
 		{
-			uint32_t lc_encrypt_type;
+			uint32_t lc_encrypt_type = 0;
 
 			DBG(LOOP, ul_debugobj(cxt, "re-using existing loop device %s",
 				loopcxt_get_device(&lc)));

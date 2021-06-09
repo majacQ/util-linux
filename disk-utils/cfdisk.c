@@ -747,6 +747,20 @@ static void ui_clean_warn(void)
 	clrtoeol();
 }
 
+static int __attribute__((__noreturn__)) ui_err(int rc, const char *fmt, ...)
+		{
+	va_list ap;
+	ui_end();
+
+	va_start(ap, fmt);
+	fprintf(stderr, "%s: ", program_invocation_short_name);
+	vfprintf(stderr, fmt, ap);
+	fprintf(stderr, ": %s\n", strerror(errno));
+	va_end(ap);
+
+	exit(rc);
+}
+
 static int __attribute__((__noreturn__)) ui_errx(int rc, const char *fmt, ...)
 		{
 	va_list ap;
@@ -2136,7 +2150,7 @@ static int ui_create_label(struct cfdisk *cf)
 
 		if (refresh_menu) {
 			ui_draw_menu(cf);
-			ui_hint(_("Select a type to create a new label or press 'L' to load script file."));
+			ui_hint(_("Select a type to create a new label, press 'L' to load script file, 'Q' quits."));
 			refresh();
 			refresh_menu = 0;
 		}
@@ -2195,6 +2209,7 @@ static int ui_help(void)
 		N_("  h          Print this screen"),
 		N_("  n          Create new partition from free space"),
 		N_("  q          Quit program without writing partition table"),
+		N_("  r          Reduce or enlarge the current partition"),
 		N_("  s          Fix partitions order (only when in disarray)"),
 		N_("  t          Change the partition type"),
 		N_("  u          Dump disk layout to sfdisk compatible script file"),
@@ -2529,9 +2544,11 @@ static int ui_run(struct cfdisk *cf)
 
 	if (!fdisk_has_label(cf->cxt) || cf->zero_start) {
 		rc = ui_create_label(cf);
-		if (rc < 0)
-			ui_errx(EXIT_FAILURE,
+		if (rc < 0) {
+			errno = -rc;
+			ui_err(EXIT_FAILURE,
 					_("failed to create a new disklabel"));
+		}
 		if (rc)
 			return rc;
 	}
@@ -2552,7 +2569,9 @@ static int ui_run(struct cfdisk *cf)
 	ui_draw_extra(cf);
 
 	if (fdisk_is_readonly(cf->cxt))
-		ui_warnx(_("Device is open in read-only mode."));
+		ui_warnx(_("Device is open in read-only mode. Changes will remain in memory only."));
+	else if (cf->device_is_used)
+		ui_warnx(_("Device is currently in use, repartitioning is probably a bad idea."));
 	else if (cf->wrong_order)
 		ui_info(_("Note that partition table entries are not in disk order now."));
 
@@ -2651,6 +2670,7 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" -z, --zero               start with zeroed partition table\n"), out);
 	fprintf(out,
 	      _("     --lock[=<mode>]      use exclusive device lock (%s, %s or %s)\n"), "yes", "no", "nonblock");
+	fputs(_(" -r, --read-only          forced open cfdisk in read-only mode\n"), out);
 
 	fputs(USAGE_SEPARATOR, out);
 	printf(USAGE_HELP_OPTIONS(26));
@@ -2663,6 +2683,7 @@ int main(int argc, char *argv[])
 {
 	const char *diskpath = NULL, *lockmode = NULL;
 	int rc, c, colormode = UL_COLORMODE_UNDEF;
+	int read_only = 0;
 	struct cfdisk _cf = { .lines_idx = 0 },
 		      *cf = &_cf;
 	enum {
@@ -2674,6 +2695,7 @@ int main(int argc, char *argv[])
 		{ "help",    no_argument,       NULL, 'h' },
 		{ "version", no_argument,       NULL, 'V' },
 		{ "zero",    no_argument,	NULL, 'z' },
+		{ "read-only", no_argument,     NULL, 'r' },
 		{ NULL, 0, NULL, 0 },
 	};
 
@@ -2682,7 +2704,7 @@ int main(int argc, char *argv[])
 	textdomain(PACKAGE);
 	close_stdout_atexit();
 
-	while((c = getopt_long(argc, argv, "L::hVz", longopts, NULL)) != -1) {
+	while((c = getopt_long(argc, argv, "L::hVzr", longopts, NULL)) != -1) {
 		switch(c) {
 		case 'h':
 			usage();
@@ -2693,6 +2715,9 @@ int main(int argc, char *argv[])
 				colormode = colormode_or_err(optarg,
 						_("unsupported color mode"));
 			break;
+                case 'r':
+                        read_only = 1;
+                        break;
 		case 'V':
 			print_version(EXIT_SUCCESS);
 		case 'z':
@@ -2736,8 +2761,8 @@ int main(int argc, char *argv[])
 	} else
 		diskpath = argv[optind];
 
-	rc = fdisk_assign_device(cf->cxt, diskpath, 0);
-	if (rc == -EACCES)
+	rc = fdisk_assign_device(cf->cxt, diskpath, read_only);
+	if (rc == -EACCES && read_only == 0)
 		rc = fdisk_assign_device(cf->cxt, diskpath, 1);
 	if (rc != 0)
 		err(EXIT_FAILURE, _("cannot open %s"), diskpath);

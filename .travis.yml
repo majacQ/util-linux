@@ -24,13 +24,13 @@ stages:
 jobs:
   include:
     # test old Ubuntu 12.04 and OSX for compatibility
-    - dist: precise
-      compiler: gcc
-      env: PRECISE="yes" MAKE_CHECK="root"
-    - os: osx
-      osx_image: xcode9.4
-      compiler: clang
-      env: MAKE_CHECK="root"
+    #- dist: precise
+    #  compiler: gcc
+    #  env: PRECISE="yes" MAKE_CHECK="root"
+    #- os: osx
+    #  osx_image: xcode10.1
+    #  compiler: clang
+    #  env: MAKE_CHECK="root"
     - arch: arm64
       compiler: gcc-10
       env: MAKE_CHECK="root"

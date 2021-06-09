@@ -1,17 +1,29 @@
-
-noinst_LTLIBRARIES += libcommon.la
+#
+# Use only LGPL or Public domain (preferred) code in libcommon, otherwise add
+# your lib/file.c directly to the _SOURCES= of the target binary.
+#
+# THIS LIBRARY IS NOT DISTRIBUTED!
+#
+# It's just ar(1) archive used by build-system to keep things simple.
+#
+# Note that you need "make install-strip" (or proper rpm / Debian build)
+# to generate binaries with only relevant stuff.
+#
+EXTRA_LTLIBRARIES += libcommon.la
 libcommon_la_CFLAGS = $(AM_CFLAGS)
 libcommon_la_SOURCES = \
 	lib/blkdev.c \
+	lib/buffer.c \
 	lib/canonicalize.c \
+	lib/color-names.c \
 	lib/crc32.c \
 	lib/crc32c.c \
-	lib/env.c \
-	lib/idcache.c \
+	lib/c_strtod.c \
 	lib/encode.c \
+	lib/env.c \
 	lib/fileutils.c \
-	lib/ismounted.c \
-	lib/color-names.c \
+	lib/idcache.c \
+	lib/jsonwrt.c \
 	lib/mangle.c \
 	lib/match.c \
 	lib/mbsalign.c \
@@ -20,24 +32,18 @@ libcommon_la_SOURCES = \
 	lib/pager.c \
 	lib/pwdutils.c \
 	lib/randutils.c \
-	lib/setproctitle.c \
-	lib/strutils.c \
-	lib/timeutils.c \
-	lib/ttyutils.c \
-	lib/exec_shell.c \
-	lib/strv.c \
 	lib/sha1.c \
-	lib/signames.c
+	lib/signames.c \
+	lib/strutils.c \
+	lib/strv.c \
+	lib/timeutils.c \
+	lib/ttyutils.c
 
 if LINUX
 libcommon_la_SOURCES += \
-	lib/caputils.c \
 	lib/linux_version.c \
+	lib/procutils.c \
 	lib/loopdev.c
-endif
-
-if USE_PLYMOUTH_SUPPORT
-libcommon_la_SOURCES += lib/plymouth-ctrl.c
 endif
 
 if !HAVE_LANGINFO_H
@@ -51,12 +57,11 @@ endif
 if HAVE_OPENAT
 if HAVE_DIRFD
 libcommon_la_SOURCES += lib/path.c
-libcommon_la_SOURCES += lib/procutils.c
 libcommon_la_SOURCES += lib/sysfs.c
 endif
 endif
 
-noinst_LTLIBRARIES += libtcolors.la
+EXTRA_LTLIBRARIES += libtcolors.la
 libtcolors_la_CFLAGS = $(AM_CFLAGS)
 libtcolors_la_SOURCES = lib/colors.c lib/color-names.c include/colors.h include/color-names.h
 libtcolors_la_LIBADD =
@@ -71,11 +76,12 @@ libtcolors_la_CFLAGS += $(NCURSES_CFLAGS)
 endif
 endif # !HAVE_TINFO
 
-dist_man_MANS += lib/terminal-colors.d.5
-
+MANPAGES += lib/terminal-colors.d.5
+dist_noinst_DATA += lib/terminal-colors.d.5.adoc
 
 check_PROGRAMS += \
 	test_blkdev \
+	test_buffer \
 	test_canonicalize \
 	test_colors \
 	test_fileutils \
@@ -86,7 +92,8 @@ check_PROGRAMS += \
 	test_remove_env \
 	test_strutils \
 	test_ttyutils \
-	test_timeutils
+	test_timeutils \
+	test_c_strtod
 
 
 if LINUX
@@ -95,7 +102,10 @@ check_PROGRAMS += test_cpuset
 endif
 check_PROGRAMS += \
 	test_sysfs \
-	test_pager
+	test_pager \
+	test_caputils \
+	test_loopdev \
+	test_linux_version
 endif
 
 if HAVE_OPENAT
@@ -104,6 +114,10 @@ check_PROGRAMS += test_procutils
 check_PROGRAMS += test_path
 endif
 endif
+
+test_caputils_SOURCES = lib/caputils.c
+test_caputils_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_CAPUTILS
+test_caputils_LDADD = $(LDADD) libcommon.la
 
 test_ttyutils_SOURCES = lib/ttyutils.c
 test_ttyutils_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_TTYUTILS
@@ -122,6 +136,9 @@ test_mangle_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_MANGLE
 
 test_strutils_SOURCES = lib/strutils.c
 test_strutils_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_STRUTILS
+
+test_c_strtod_SOURCES = lib/c_strtod.c
+test_c_strtod_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM
 
 test_colors_SOURCES = lib/colors.c lib/color-names.c
 test_colors_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_COLORS
@@ -167,7 +184,6 @@ test_sysfs_LDADD = $(LDADD)
 test_pager_SOURCES = lib/pager.c
 test_pager_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_PAGER
 
-check_PROGRAMS += test_linux_version
 test_linux_version_SOURCES = lib/linux_version.c
 test_linux_version_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_LINUXVERSION
 endif
@@ -186,3 +202,15 @@ test_pwdutils_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM
 
 test_remove_env_SOURCES = lib/env.c
 test_remove_env_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM
+
+test_buffer_SOURCES = lib/buffer.c
+test_buffer_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_BUFFER
+
+if LINUX
+test_loopdev_SOURCES = lib/loopdev.c \
+		       lib/blkdev.c \
+		       lib/linux_version.c \
+		       $(test_sysfs_SOURCES) \
+		       $(test_canonicalize_SOURCES)
+test_loopdev_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM_LOOPDEV
+endif

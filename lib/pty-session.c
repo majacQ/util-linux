@@ -18,6 +18,7 @@
 #include <paths.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <inttypes.h>
 
 #include "c.h"
 #include "all-io.h"
@@ -129,7 +130,8 @@ void ul_pty_set_mainloop_time(struct ul_pty *pty, struct timeval *tv)
 	} else {
 		pty->next_callback_time.tv_sec = tv->tv_sec;
 		pty->next_callback_time.tv_usec = tv->tv_usec;
-		DBG(IO, ul_debugobj(pty, "mainloop time: %ld.%06ld", tv->tv_sec, tv->tv_usec));
+		DBG(IO, ul_debugobj(pty, "mainloop time: %"PRId64".%06"PRId64,
+				(int64_t) tv->tv_sec, (int64_t) tv->tv_usec));
 	}
 }
 
@@ -239,6 +241,15 @@ void ul_pty_cleanup(struct ul_pty *pty)
 	tcsetattr(STDIN_FILENO, TCSADRAIN, &rtt);
 }
 
+int ul_pty_chownmod_slave(struct ul_pty *pty, uid_t uid, gid_t gid, mode_t mode)
+{
+	if (fchown(pty->slave, uid, gid))
+		return -errno;
+	if (fchmod(pty->slave, mode))
+		return -errno;
+	return 0;
+}
+
 /* call me in child process */
 void ul_pty_init_slave(struct ul_pty *pty)
 {
@@ -340,12 +351,17 @@ static int handle_io(struct ul_pty *pty, int fd, int *eof)
 	char buf[BUFSIZ];
 	ssize_t bytes;
 	int rc = 0;
+	sigset_t set;
 
 	DBG(IO, ul_debugobj(pty, " handle I/O on fd=%d", fd));
 	*eof = 0;
 
+	sigemptyset(&set);
+	sigaddset(&set, SIGTTIN);
+	sigprocmask(SIG_UNBLOCK, &set, NULL);
 	/* read from active FD */
 	bytes = read(fd, buf, sizeof(buf));
+	sigprocmask(SIG_BLOCK, &set, NULL);
 	if (bytes < 0) {
 		if (errno == EAGAIN || errno == EINTR)
 			return 0;
@@ -409,8 +425,8 @@ void ul_pty_wait_for_child(struct ul_pty *pty)
 		}
 	} else {
 		/* final wait */
-		while ((pid = wait3(&status, options, NULL)) > 0) {
-			DBG(SIG, ul_debug(" wait3 done [rc=%d]", (int) pid));
+		while ((pid = waitpid(-1, &status, options)) > 0) {
+			DBG(SIG, ul_debug(" waitpid done [rc=%d]", (int) pid));
 			if (pid == pty->child) {
 				if (pty->callbacks.child_die)
 					pty->callbacks.child_die(
@@ -451,9 +467,10 @@ static int handle_signal(struct ul_pty *pty, int fd)
 			else
 				ul_pty_wait_for_child(pty);
 
-		} else if (info.ssi_status == SIGSTOP && pty->child > 0)
+		} else if (info.ssi_status == SIGSTOP && pty->child > 0) {
 			pty->callbacks.child_sigstop(pty->callback_data,
 						     pty->child);
+		}
 
 		if (pty->child <= 0) {
 			DBG(SIG, ul_debugobj(pty, " no child, setting leaving timeout"));
@@ -571,16 +588,15 @@ int ul_pty_proxy_master(struct ul_pty *pty)
 				rc = mainloop_callback(pty);
 				if (rc == 0)
 					continue;
-			} else
+			} else {
 				rc = 0;
+			}
 
 			DBG(IO, ul_debugobj(pty, "leaving poll() loop [timeout=%d, rc=%d]", timeout, rc));
 			break;
 		}
 		/* event */
 		for (i = 0; i < ARRAY_SIZE(pfd); i++) {
-			rc = 0;
-
 			if (pfd[i].revents == 0)
 				continue;
 
@@ -594,34 +610,42 @@ int ul_pty_proxy_master(struct ul_pty *pty)
 						pfd[i].revents & POLLERR ? "POLLERR" : "",
 						pfd[i].revents & POLLNVAL ? "POLLNVAL" : ""));
 
-			switch (i) {
-			case POLLFD_STDIN:
-			case POLLFD_MASTER:
-				/* data */
-				if (pfd[i].revents & POLLIN)
-					rc = handle_io(pty, pfd[i].fd, &eof);
-				/* EOF maybe detected in two ways; they are as follows:
-				 *	A) poll() return POLLHUP event after close()
-				 *	B) read() returns 0 (no data)
-				 *
-				 * POLLNVAL means that fd is closed.
-				 */
-				if ((pfd[i].revents & POLLHUP) || (pfd[i].revents & POLLNVAL) || eof) {
-					DBG(IO, ul_debugobj(pty, " ignore FD"));
-					pfd[i].fd = -1;
-					if (i == POLLFD_STDIN) {
-						ul_pty_write_eof_to_child(pty);
-						DBG(IO, ul_debugobj(pty, "  ignore STDIN"));
-					}
-				}
-				continue;
-			case POLLFD_SIGNAL:
+			if (i == POLLFD_SIGNAL)
 				rc = handle_signal(pty, pfd[i].fd);
+			else if (pfd[i].revents & POLLIN)
+				rc = handle_io(pty, pfd[i].fd, &eof); /* data */
+
+			if (rc) {
+				ul_pty_write_eof_to_child(pty);
 				break;
 			}
-			if (rc)
-				break;
+
+			if (i == POLLFD_SIGNAL)
+				continue;
+
+			/* EOF maybe detected in two ways; they are as follows:
+			 *	A) poll() return POLLHUP event after close()
+			 *	B) read() returns 0 (no data)
+			 *
+			 * POLLNVAL means that fd is closed.
+			 */
+			if ((pfd[i].revents & POLLHUP) || (pfd[i].revents & POLLNVAL) || eof) {
+				DBG(IO, ul_debugobj(pty, " ignore FD"));
+				pfd[i].fd = -1;
+				if (i == POLLFD_STDIN) {
+					ul_pty_write_eof_to_child(pty);
+					DBG(IO, ul_debugobj(pty, "  ignore STDIN"));
+				}
+			}
 		}
+		if (rc)
+			break;
+	}
+
+	if (rc && pty->child && pty->child != (pid_t) -1 && !pty->delivered_signal) {
+		kill(pty->child, SIGTERM);
+		sleep(2);
+		kill(pty->child, SIGKILL);
 	}
 
 	pty_signals_cleanup(pty);
@@ -686,9 +710,9 @@ int main(int argc, char *argv[])
 		shname = shname ? shname + 1 : shell;
 
 		if (command)
-			execl(shell, shname, "-c", command, NULL);
+			execl(shell, shname, "-c", command, (char *)NULL);
 		else
-			execl(shell, shname, "-i", NULL);
+			execl(shell, shname, "-i", (char *)NULL);
 		err(EXIT_FAILURE, "failed to execute %s", shell);
 		break;
 

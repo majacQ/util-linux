@@ -119,7 +119,7 @@ static int process_next_step(struct scriptlive *ss)
 		delay = replay_step_get_delay(ss->step);
 		if (timerisset(delay)) {
 			/* wait until now+delay in mainloop */
-			struct timeval now, target;
+			struct timeval now = { 0 }, target = { 0 };
 
 			gettime_monotonic(&now);
 			timeradd(&now, delay, &target);
@@ -316,14 +316,14 @@ main(int argc, char *argv[])
 
 		if (access(shell, X_OK) == 0) {
 			if (command)
-				execl(shell, shname, "-c", command, NULL);
+				execl(shell, shname, "-c", command, (char *)NULL);
 			else
-				execl(shell, shname, "-i", NULL);
+				execl(shell, shname, "-i", (char *)NULL);
 		} else {
 			if (command)
-				execlp(shname, "-c", command, NULL);
+				execlp(shname, "-c", command, (char *)NULL);
 			else
-				execlp(shname, "-i", NULL);
+				execlp(shname, "-i", (char *)NULL);
 		}
 		err(EXIT_FAILURE, "failed to execute %s", shell);
 		break;

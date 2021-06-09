@@ -136,7 +136,8 @@ typedef enum {
 	more_kc_set_lines_per_screen,
 	more_kc_set_scroll_len,
 	more_kc_quit,
-	more_kc_skip_forward,
+	more_kc_skip_forward_screen,
+	more_kc_skip_forward_line,
 	more_kc_next_line,
 	more_kc_clear_screen,
 	more_kc_previous_search_match,
@@ -398,21 +399,12 @@ static int check_magic(struct more_control *ctl, char *fs)
 	const int fd = fileno(ctl->current_file);
 	const char *mime_encoding = magic_descriptor(ctl->magic, fd);
 	const char *magic_error_msg = magic_error(ctl->magic);
-	struct stat st;
 
 	if (magic_error_msg) {
-		printf(_("magic failed: %s\n"), magic_error_msg);
+		printf("%s: %s: %s\n", program_invocation_short_name,
+			_("magic failed"), magic_error_msg);
 		return 0;
 	}
-	if (fstat(fd, &st)) {
-		warn(_("cannot stat %s"), fs);
-		return 1;
-	}
-	if (st.st_size == 0) {
-		/* libmagic tells an empty file has binary encoding */
-		return 0;
-	}
-
 	if (!mime_encoding || !(strcmp("binary", mime_encoding))) {
 		printf(_("\n******** %s: Not a text file ********\n\n"), fs);
 		return 1;
@@ -453,20 +445,26 @@ static void checkf(struct more_control *ctl, char *fs)
 	ctl->current_line = 0;
 	ctl->file_position = 0;
 	fflush(NULL);
-	if (((ctl->current_file = fopen(fs, "r")) == NULL) ||
-	    (fstat(fileno(ctl->current_file), &st) != 0)) {
+
+	ctl->current_file = fopen(fs, "r");
+	if (ctl->current_file == NULL) {
 		if (ctl->clear_line_ends)
 			putp(ctl->erase_line);
 		warn(_("cannot open %s"), fs);
 		return;
 	}
-#ifndef HAVE_MAGIC
+	if (fstat(fileno(ctl->current_file), &st) != 0) {
+		warn(_("cannot stat %s"), fs);
+		return;
+	}
 	if ((st.st_mode & S_IFMT) == S_IFDIR) {
 		printf(_("\n*** %s: directory ***\n\n"), fs);
 		ctl->current_file = NULL;
 		return;
 	}
-#endif
+	if (st.st_size == 0) {
+		return;
+	}
 	if (check_magic(ctl, fs)) {
 		fclose(ctl->current_file);
 		ctl->current_file = NULL;
@@ -729,7 +727,7 @@ static void output_prompt(struct more_control *ctl, char *filename)
 		ctl->prompt_len += printf(_("--More--"));
 		if (filename != NULL) {
 			ctl->prompt_len += printf(_("(Next file: %s)"), filename);
-		} else if (!ctl->no_tty_in) {
+		} else if (!ctl->no_tty_in && 0 < ctl->file_size) {
 			ctl->prompt_len +=
 			    printf("(%d%%)",
 				   (int)((ctl->file_position * 100) / ctl->file_size));
@@ -817,13 +815,13 @@ static struct number_command read_command(struct more_control *ctl)
 			cmd.key = more_kc_backwards;
 			return cmd;
 		} else if (!memcmp(input, ARROW_DOWN, sizeof(ARROW_DOWN))) {
-			cmd.key = more_kc_skip_forward;
+			cmd.key = more_kc_jump_lines_per_screen;
 			return cmd;
 		} else if (!memcmp(input, PAGE_UP, sizeof(PAGE_UP))) {
 			cmd.key = more_kc_backwards;
 			return cmd;
 		} else if (!memcmp(input, PAGE_DOWN, sizeof(PAGE_DOWN))) {
-			cmd.key = more_kc_skip_forward;
+			cmd.key = more_kc_jump_lines_per_screen;
 			return cmd;
 		}
 	}
@@ -884,9 +882,11 @@ static struct number_command read_command(struct more_control *ctl)
 			cmd.key = more_kc_quit;
 			break;
 		case 'f':
-		case 's':
 		case CTRL('F'):
-			cmd.key = more_kc_skip_forward;
+			cmd.key = more_kc_skip_forward_screen;
+			break;
+		case 's':
+			cmd.key = more_kc_skip_forward_line;
 			break;
 		case '\n':
 			cmd.key = more_kc_next_line;
@@ -1646,8 +1646,13 @@ static int more_key_command(struct more_control *ctl, char *filename)
 			break;
 		case more_kc_quit:
 			more_exit(ctl);
-		case more_kc_skip_forward:
-			if (skip_forwards(ctl, cmd.number, cmd.number))
+		case more_kc_skip_forward_screen:
+			if (skip_forwards(ctl, cmd.number, 'f'))
+				retval = ctl->lines_per_screen;
+			done = 1;
+			break;
+		case more_kc_skip_forward_line:
+			if (skip_forwards(ctl, cmd.number, 's'))
 				retval = ctl->lines_per_screen;
 			done = 1;
 			break;

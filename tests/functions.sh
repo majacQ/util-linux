@@ -288,6 +288,10 @@ function ts_init_env {
 	top_srcdir=$(ts_abspath $top_srcdir)
 	top_builddir=$(ts_abspath $top_builddir)
 
+        if [ -e "$top_builddir/meson.conf" ]; then
+            . "$top_builddir/meson.conf"
+        fi
+
 	# We use helpser always from build tree
 	ts_helpersdir="${top_builddir}/"
 
@@ -432,15 +436,23 @@ function ts_init_suid {
 function ts_init_py {
 	LIBNAME="$1"
 
-	[ -f "$top_builddir/py${LIBNAME}.la" ] || ts_skip "py${LIBNAME} not compiled"
+	if [ -f "$top_builddir/py${LIBNAME}.la" ]; then
+            # autotoolz build
+	    export LD_LIBRARY_PATH="$top_builddir/.libs:$LD_LIBRARY_PATH"
+	    export PYTHONPATH="$top_builddir/$LIBNAME/python:$top_builddir/.libs:$PYTHONPATH"
 
-	export LD_LIBRARY_PATH="$top_builddir/.libs:$LD_LIBRARY_PATH"
-	export PYTHONPATH="$top_builddir/$LIBNAME/python:$top_builddir/.libs:$PYTHONPATH"
+	    PYTHON_VERSION=$(awk '/^PYTHON_VERSION/ { print $3 }' $top_builddir/Makefile)
+	    PYTHON_MAJOR_VERSION=$(echo $PYTHON_VERSION | sed 's/\..*//')
 
-	export PYTHON_VERSION=$(awk '/^PYTHON_VERSION/ { print $3 }' $top_builddir/Makefile)
-	export PYTHON_MAJOR_VERSION=$(echo $PYTHON_VERSION | sed 's/\..*//')
+	    export PYTHON="python${PYTHON_MAJOR_VERSION}"
 
-	export PYTHON="python${PYTHON_MAJOR_VERSION}"
+        elif compgen -G "$top_builddir/$LIBNAME/python/py$LIBNAME*.so" >/dev/null; then
+            # mezon!
+            export PYTHONPATH="$top_builddir/$LIBNAME/python:$PYTHONPATH"
+
+        else
+            ts_skip "py${LIBNAME} not compiled"
+        fi
 }
 
 function ts_run {
@@ -691,15 +703,41 @@ function ts_fstype_by_devname {
 	return $?
 }
 
+function ts_vfs_dump {
+	if [ "$TS_SHOWDIFF" == "yes" -a "$TS_KNOWN_FAIL" != "yes" ]; then
+		echo
+		echo "{{{{ VFS dump:"
+		findmnt
+		echo "}}}}"
+	fi
+}
+
+function ts_blk_dump {
+	if [ "$TS_SHOWDIFF" == "yes" -a "$TS_KNOWN_FAIL" != "yes" ]; then
+		echo
+		echo "{{{{ blkdevs dump:"
+		lsblk -o+FSTYPE
+		echo "}}}}"
+	fi
+}
+
 function ts_device_has {
 	local TAG="$1"
 	local VAL="$2"
 	local DEV="$3"
 	local vl=""
+	local res=""
 
 	vl=$(ts_blkidtag_by_devname "$TAG" "$DEV")
 	test $? = 0 -a "$vl" = "$VAL"
-	return $?
+	res=$?
+
+	if [ "$res" != 0 ]; then
+		ts_vfs_dump
+		ts_blk_dump
+	fi
+
+	return $res
 }
 
 function ts_is_uuid()
@@ -1050,5 +1088,19 @@ function ts_has_ncurses_support {
 		echo "yes"
 	else
 		echo "no"
+	fi
+}
+
+# Get path to the ASan runtime DSO the given binary was compiled with
+function ts_get_asan_rt_path {
+	local binary="${1?}"
+	local rt_path
+
+	ts_check_prog "ldd"
+	ts_check_prog "awk"
+
+	rt_path="$(ldd "$binary" | awk '/lib.+asan.*.so/ {print $3; exit}')"
+	if [ -n "$rt_path" -a -f "$rt_path" ]; then
+		echo "$rt_path"
 	fi
 }

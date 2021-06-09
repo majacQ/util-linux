@@ -146,7 +146,7 @@ static void print_all(struct libmnt_context *cxt, char *pattern, int show_label)
 		if (type && pattern && !mnt_match_fstype(type, pattern))
 			continue;
 
-		if (!mnt_fs_is_pseudofs(fs) && !mnt_fs_is_netfs(fs))
+		if (mnt_fs_is_regularfs(fs))
 			xsrc = mnt_pretty_path(src, cache);
 		printf ("%s on ", xsrc ? xsrc : src);
 		safe_fputs(mnt_fs_get_target(fs));
@@ -312,14 +312,14 @@ static void success_message(struct libmnt_context *cxt)
 }
 
 #if defined(HAVE_LIBSELINUX) && defined(HAVE_SECURITY_GET_INITIAL_CONTEXT)
-#include <selinux/selinux.h>
-#include <selinux/context.h>
+# include <selinux/selinux.h>
+# include <selinux/context.h>
 
 static void selinux_warning(struct libmnt_context *cxt, const char *tgt)
 {
 
 	if (tgt && mnt_context_is_verbose(cxt) && is_selinux_enabled() > 0) {
-		security_context_t raw = NULL, def = NULL;
+		char *raw = NULL, *def = NULL;
 
 		if (getfilecon(tgt, &raw) > 0
 		    && security_get_initial_context("file", &def) == 0) {
@@ -327,7 +327,7 @@ static void selinux_warning(struct libmnt_context *cxt, const char *tgt)
 		if (!selinux_file_context_cmp(raw, def))
 			printf(_(
 	"mount: %s does not contain SELinux labels.\n"
-	"       You just mounted an file system that supports labels which does not\n"
+	"       You just mounted a file system that supports labels which does not\n"
 	"       contain labels, onto an SELinux box. It is likely that confined\n"
 	"       applications will generate AVC messages and not be allowed access to\n"
 	"       this file system.  For more details see restorecon(8) and mount(8).\n"),
@@ -484,7 +484,7 @@ static void __attribute__((__noreturn__)) usage(void)
 	"     --target <target>   explicitly specifies mountpoint\n"));
 	fprintf(out, _(
 	"     --target-prefix <path>\n"
-	"                         specifies path use for all mountpoints\n"));
+	"                         specifies path used for all mountpoints\n"));
 	fprintf(out, _(
 	" -v, --verbose           say what is being done\n"));
 	fprintf(out, _(
@@ -1003,4 +1003,3 @@ done:
 	env_list_free(envs_removed);
 	return rc;
 }
-

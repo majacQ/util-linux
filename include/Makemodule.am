@@ -3,6 +3,7 @@ dist_noinst_HEADERS += \
 	include/all-io.h \
 	include/bitops.h \
 	include/blkdev.h \
+	include/buffer.h \
 	include/canonicalize.h \
 	include/carefulputc.h \
 	include/cctype.h \
@@ -14,6 +15,7 @@ dist_noinst_HEADERS += \
 	include/cpuset.h \
 	include/crc32.h \
 	include/crc32c.h \
+	include/c_strtod.h \
 	include/debug.h \
 	include/debugobj.h \
 	include/encode.h \
@@ -25,6 +27,7 @@ dist_noinst_HEADERS += \
 	include/idcache.h \
 	include/ismounted.h \
 	include/iso9660.h \
+	include/jsonwrt.h \
 	include/pwdutils.h \
 	include/linux_version.h \
 	include/list.h \
@@ -56,7 +59,7 @@ dist_noinst_HEADERS += \
 	include/rpmatch.h \
 	include/sha1.h \
 	include/signames.h \
-	include/setproctitle.h \
+	include/selinux-utils.h \
 	include/statfs_magic.h \
 	include/strutils.h \
 	include/strv.h \

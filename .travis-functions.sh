@@ -27,7 +27,7 @@ fi
 
 ## some config settings
 # travis docs say we get 1.5 CPUs
-MAKE="make -j2"
+MAKE="make -j2 V=1"
 DUMP_CONFIG_LOG="short"
 
 # Coverity-related settings
@@ -311,6 +311,7 @@ function travis_before_script
 {
 	set -o xtrace
 
+	git clean -xdf
 	./autogen.sh
 	ret=$?
 

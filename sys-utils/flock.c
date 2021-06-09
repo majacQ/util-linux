@@ -212,6 +212,8 @@ int main(int argc, char *argv[])
 		case 'E':
 			conflict_exit_code = strtos32_or_err(optarg,
 				_("invalid exit code"));
+			if (conflict_exit_code < 0 || conflict_exit_code > 255)
+				errx(EX_USAGE, _("exit code out of range (expected 0 to 255)"));
 			break;
 		case OPT_VERBOSE:
 			verbose = 1;
@@ -329,9 +331,10 @@ int main(int argc, char *argv[])
 
 		gettime_monotonic(&time_done);
 		timersub(&time_done, &time_start, &delta);
-		printf(_("%s: getting lock took %ld.%06ld seconds\n"),
-		       program_invocation_short_name, delta.tv_sec,
-		       delta.tv_usec);
+		printf(_("%s: getting lock took %"PRId64".%06"PRId64" seconds\n"),
+		       program_invocation_short_name,
+		       (int64_t) delta.tv_sec,
+		       (int64_t) delta.tv_usec);
 	}
 	status = EX_OK;
 
