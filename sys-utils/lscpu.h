@@ -1,5 +1,18 @@
+/*
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * Copyright (C) 2013 Ondrej Oprala <ooprala@redhat.com>
+ * Copyright (C) 2013-2023 Karel Zak <kzak@redhat.com>
+ */
 #ifndef LSCPU_H
 #define LSCPU_H
+
+#include <stdbool.h>
 
 #include "c.h"
 #include "nls.h"
@@ -32,7 +45,6 @@ UL_DEBUG_DECLARE_MASK(lscpu);
 #define _PATH_SYS_CPU		_PATH_SYS_SYSTEM "/cpu"
 #define _PATH_SYS_NODE		_PATH_SYS_SYSTEM "/node"
 #define _PATH_SYS_DMI		"/sys/firmware/dmi/tables/DMI"
-#define _PATH_SYS_DMI_TYPE4	"/sys/firmware/dmi/entries/4-0/raw"
 #define _PATH_ACPI_PPTT		"/sys/firmware/acpi/tables/PPTT"
 
 struct lscpu_cache {
@@ -65,14 +77,15 @@ struct lscpu_cputype {
 	char	*model;
 	char	*modelname;
 	char	*bios_modelname; /* aarch64 */
+	char	*bios_family; /* aarch64 */
 	char	*revision;	/* alternative for model (ppc) */
 	char	*stepping;
 	char    *bogomips;
 	char	*flags;
 	char	*mtid;		/* maximum thread id (s390) */
 	char	*addrsz;	/* address sizes */
-	int	dispatching;	/* -1 if not evailable, DIST_* */
-	int	freqboost;	/* -1 if not evailable */
+	int	dispatching;	/* -1 if not available, DIST_* */
+	int	freqboost;	/* -1 if not available */
 
 	size_t	physsockets;	/* Physical sockets (modules) */
 	size_t	physchips;	/* Physical chips */
@@ -97,12 +110,14 @@ struct lscpu_cputype {
 	size_t		ndrawers;
 	cpu_set_t	**drawermaps;
 
-	unsigned int	has_freq : 1,
-			has_configured : 1,
-			has_polarization : 1,
-			has_addresses : 1;
+	bool	has_freq,
+		has_configured,
+		has_polarization,
+		has_addresses;
 
 	size_t nr_socket_on_cluster; /* the number of sockets if the is_cluster is 1 */
+
+	char	*isa;	/* loongarch */
 };
 
 /* dispatching modes */
@@ -147,8 +162,8 @@ struct lscpu_cpu {
 struct lscpu_arch {
 	char	*name;		/* uname() .machine */
 
-	unsigned int	bit32:1,
-			bit64:1;
+	bool	bit32,
+		bit64;
 };
 
 struct lscpu_vulnerability {
@@ -206,12 +221,13 @@ struct lscpu_cxt {
 
 	struct path_cxt	*syscpu; /* _PATH_SYS_CPU path handler */
 	struct path_cxt *procfs; /* /proc path handler */
+	struct path_cxt *rootfs; /* / path handler */
 
 	size_t ncputypes;
 	struct lscpu_cputype **cputypes;
 
 	size_t npossibles;	/* number of possible CPUs */
-	struct lscpu_cpu **cpus; /* possible CPUs, contains gaps (cups[n]=NULL) */
+	struct lscpu_cpu **cpus; /* possible CPUs, contains gaps (cpus[n]=NULL) */
 
 	size_t npresents;
 	cpu_set_t *present;	/* mask with present CPUs */
@@ -237,17 +253,21 @@ struct lscpu_cxt {
 
 	int mode;	/* LSCPU_OUTPUT_* */
 
-	unsigned int noalive : 1,
-		     show_online : 1,
-		     show_offline : 1,
-		     show_physical : 1,
-		     show_compatible : 1,
-		     hex : 1,
-		     json : 1,
-		     bytes : 1;
+	bool	 noalive,
+		 show_online,
+		 show_offline,
+		 show_physical,
+		 show_compatible,
+		 hex,
+		 json,
+		 raw,
+		 bytes;
 
 	int is_cluster; /* For aarch64 if the machine doesn't have ACPI PPTT */
 };
+
+#define is_live(_cxt)	(!(_cxt)->noalive)
+#define is_dump(_cxt)	((_cxt)->noalive)
 
 #define is_cpu_online(_cxt, _cpu) \
 		((_cxt) && (_cpu) && (_cxt)->online && \
@@ -256,6 +276,8 @@ struct lscpu_cxt {
 #define is_cpu_present(_cxt, _cpu) \
 		((_cxt) && (_cpu) && (_cxt)->present && \
 		 CPU_ISSET_S((_cpu)->logical_id, (_cxt)->setsize, (_cxt)->present))
+
+int is_arm(struct lscpu_cxt *cxt);
 
 struct lscpu_cputype *lscpu_new_cputype(void);
 void lscpu_ref_cputype(struct lscpu_cputype *ct);
@@ -316,6 +338,13 @@ struct dmi_info {
 	char *product;
 	char *manufacturer;
 	int sockets;
+
+	/* Processor Information */
+	uint16_t processor_family;
+	char *processor_manufacturer;
+	char *processor_version;
+	uint16_t current_speed;
+	char *part_num;
 };
 
 
@@ -323,4 +352,5 @@ void to_dmi_header(struct lscpu_dmi_header *h, uint8_t *data);
 char *dmi_string(const struct lscpu_dmi_header *dm, uint8_t s);
 int parse_dmi_table(uint16_t len, uint16_t num, uint8_t *data, struct dmi_info *di);
 size_t get_number_of_physical_sockets_from_dmi(void);
+int dmi_decode_cputype(struct lscpu_cputype *);
 #endif /* LSCPU_H */

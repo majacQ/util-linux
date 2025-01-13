@@ -1,3 +1,7 @@
+/*
+ * No copyright is claimed.  This code is in the public domain; do with
+ * it what you wish.
+ */
 	{0x00, N_("Empty")},
 	{0x01, N_("FAT12")},
 	{0x02, N_("XENIX root")},
@@ -5,7 +9,7 @@
 	{0x04, N_("FAT16 <32M")},
 	{0x05, N_("Extended")},		/* DOS 3.3+ extended partition */
 	{0x06, N_("FAT16")},		/* DOS 16-bit >=32M */
-	{0x07, N_("HPFS/NTFS/exFAT")},	/* OS/2 IFS, eg, HPFS or NTFS or QNX or exFAT */
+	{0x07, N_("HPFS/NTFS/exFAT")},	/* OS/2 IFS, e.g., HPFS or NTFS or QNX or exFAT */
 	{0x08, N_("AIX")},		/* AIX boot (AIX -- PS/2 port) or SplitDrive */
 	{0x09, N_("AIX bootable")},	/* AIX data or Coherent */
 	{0x0a, N_("OS/2 Boot Manager")},/* OS/2 Boot Manager */
@@ -101,6 +105,7 @@
 	{0xf1, N_("SpeedStor")},
 	{0xf4, N_("SpeedStor")},	/* SpeedStor large partition */
 	{0xf2, N_("DOS secondary")},	/* DOS 3.3+ secondary */
+	{0xf8, N_("EBBR protective")},	/* Arm EBBR firmware protective partition */
 	{0xfb, N_("VMware VMFS")},
 	{0xfc, N_("VMware VMKCORE")},	/* VMware kernel dump partition */
 	{0xfd, N_("Linux raid autodetect")},/* Linux raid partition with

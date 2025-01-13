@@ -26,6 +26,9 @@ struct fdisk_parttype *fdisk_new_parttype(void)
 {
 	struct fdisk_parttype *t = calloc(1, sizeof(*t));
 
+	if (!t)
+		return NULL;
+
 	t->refcount = 1;
 	t->flags = FDISK_PARTTYPE_ALLOCATED;
 	DBG(PARTTYPE, ul_debugobj(t, "alloc"));
@@ -142,7 +145,7 @@ struct fdisk_parttype *fdisk_label_get_parttype(const struct fdisk_label *lb, si
 {
 	if (!lb || n >= lb->nparttypes)
 		return NULL;
-	return &lb->parttypes[n];
+	return (struct fdisk_parttype *)&lb->parttypes[n];
 }
 
 /**
@@ -234,7 +237,7 @@ struct fdisk_parttype *fdisk_label_get_parttype_from_code(
 
 	for (i = 0; i < lb->nparttypes; i++)
 		if (lb->parttypes[i].code == code)
-			return &lb->parttypes[i];
+			return (struct fdisk_parttype *)&lb->parttypes[i];
 	return NULL;
 }
 
@@ -262,7 +265,7 @@ struct fdisk_parttype *fdisk_label_get_parttype_from_string(
 	for (i = 0; i < lb->nparttypes; i++)
 		if (lb->parttypes[i].typestr
 		    && strcasecmp(lb->parttypes[i].typestr, str) == 0)
-			return &lb->parttypes[i];
+			return (struct fdisk_parttype *)&lb->parttypes[i];
 
 	return NULL;
 }
@@ -321,7 +324,8 @@ static struct fdisk_parttype *parttype_from_data(
 				unsigned int *xcode,
 				int use_seqnum)
 {
-	struct fdisk_parttype *types, *ret = NULL;
+	const struct fdisk_parttype *types;
+	struct fdisk_parttype *ret = NULL;
 	char *end = NULL;
 
 	assert(lb);
@@ -366,7 +370,7 @@ static struct fdisk_parttype *parttype_from_data(
 			if (use_seqnum && errno == 0
 			    && *end == '\0' && i > 0
 			    && i - 1 < (int) lb->nparttypes)
-				ret = &types[i - 1];
+				ret = (struct fdisk_parttype *)&types[i - 1];
 		}
 	}
 
@@ -425,7 +429,7 @@ static struct fdisk_parttype *parttype_from_name(
 		const char *name = lb->parttypes[i].name;
 
 		if (name && *name && ul_stralnumcmp(name, str) == 0)
-			return &lb->parttypes[i];
+			return (struct fdisk_parttype *)&lb->parttypes[i];
 	}
 
 	return NULL;

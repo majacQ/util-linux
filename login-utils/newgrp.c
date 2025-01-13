@@ -123,7 +123,7 @@ static int allow_setgid(const struct passwd *pe, const struct group *ge)
 {
 	char **look;
 	int notfound = 1;
-	char *pwd, *xpwd;
+	char *pwd, *xpwd, *spwd;
 
 	if (getuid() == 0)
 		/* root may do anything */
@@ -144,8 +144,8 @@ static int allow_setgid(const struct passwd *pe, const struct group *ge)
 	 * as in /etc/passwd */
 
 	/* check /etc/gshadow */
-	if (!(pwd = get_gshadow_pwd(ge->gr_name)))
-		pwd = ge->gr_passwd;
+	spwd = get_gshadow_pwd(ge->gr_name);
+	pwd = spwd ? spwd : ge->gr_passwd;
 
 	if (pwd && *pwd && (xpwd = xgetpass(stdin, _("Password: ")))) {
 		char *cbuf = crypt(xpwd, pwd);
@@ -162,6 +162,8 @@ static int allow_setgid(const struct passwd *pe, const struct group *ge)
 			return TRUE;
 	}
 
+	free(spwd);
+
 	/* default to denial */
 	return FALSE;
 }
@@ -170,14 +172,14 @@ static void __attribute__((__noreturn__)) usage(void)
 {
 	FILE *out = stdout;
 	fputs(USAGE_HEADER, out);
-	fprintf(out, _(" %s <group>\n"), program_invocation_short_name);
+	fprintf(out, _(" %s <group> [[-c] <command>]\n"), program_invocation_short_name);
 
 	fputs(USAGE_SEPARATOR, out);
-	fputs(_("Log in to a new group.\n"), out);
+	fputs(_("Log in to a new group; optionally executing a shell command.\n"), out);
 
 	fputs(USAGE_OPTIONS, out);
-	printf(USAGE_HELP_OPTIONS(16));
-	printf(USAGE_MAN_TAIL("newgrp(1)"));
+	fprintf(out, USAGE_HELP_OPTIONS(16));
+	fprintf(out, USAGE_MAN_TAIL("newgrp(1)"));
 	exit(EXIT_SUCCESS);
 }
 
@@ -185,11 +187,12 @@ int main(int argc, char *argv[])
 {
 	struct passwd *pw_entry;
 	struct group *gr_entry;
-	char *shell;
+	char *shell, *command = NULL;
 	int ch;
 	static const struct option longopts[] = {
 		{"version", no_argument, NULL, 'V'},
 		{"help", no_argument, NULL, 'h'},
+		{"command", required_argument, NULL, 'c'},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -198,8 +201,11 @@ int main(int argc, char *argv[])
 	textdomain(PACKAGE);
 	close_stdout_atexit();
 
-	while ((ch = getopt_long(argc, argv, "Vh", longopts, NULL)) != -1)
+	while ((ch = getopt_long(argc, argv, "c:Vh", longopts, NULL)) != -1)
 		switch (ch) {
+		case 'c':
+			command = optarg;
+			break;
 		case 'V':
 			print_version(EXIT_SUCCESS);
 		case 'h':
@@ -211,12 +217,12 @@ int main(int argc, char *argv[])
 	if (!(pw_entry = getpwuid(getuid())))
 		err(EXIT_FAILURE, _("who are you?"));
 
-	if (argc < 2) {
+	if (argc <= optind) {
 		if (setgid(pw_entry->pw_gid) < 0)
 			err(EXIT_FAILURE, _("setgid failed"));
 	} else {
 		errno = 0;
-		if (!(gr_entry = getgrnam(argv[1]))) {
+		if (!(gr_entry = getgrnam(argv[optind++]))) {
 			if (errno)
 				err(EXIT_FAILURE, _("no such group"));
 			else
@@ -234,6 +240,8 @@ int main(int argc, char *argv[])
 	fflush(NULL);
 	shell = (pw_entry->pw_shell && *pw_entry->pw_shell ?
 				pw_entry->pw_shell : _PATH_BSHELL);
-	execl(shell, shell, (char *)NULL);
+	if (!command && optind < argc)
+		command = argv[optind];
+	execl(shell, shell, command ? "-c" : NULL, command, (char *)NULL);
 	errexec(shell);
 }

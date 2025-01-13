@@ -50,7 +50,7 @@ static void check_padding_debug(struct libscols_table *tb)
 {
 	const char *str;
 
-	assert(libsmartcols_debug_mask);	/* debug has to be enabled! */
+	assert(libsmartcols_debug_mask);	/* debug has to be already initialized! */
 
 	str = getenv("LIBSMARTCOLS_DEBUG_PADDING");
 	if (!str || (strcmp(str, "on") != 0 && strcmp(str, "1") != 0))
@@ -365,16 +365,24 @@ int scols_table_move_column(struct libscols_table *tb,
  *
  * This is shortcut for
  *
- *   cl = scols_new_column();
- *   scols_column_set_....(cl, ...);
- *   scols_table_add_column(tb, cl);
+ * <informalexample>
+ *   <programlisting language="C">
+ *     cl = scols_new_column();
+ *     scols_column_set_....(cl, ...);
+ *     scols_table_add_column(tb, cl);
+ *   </programlisting>
+ * </informalexample>
  *
  * The column width is possible to define by:
  *
- *  @whint: 0 < N < 1  : relative width, percent of terminal width
+ * <informalexample>
+ * <programlisting>
+ * whint: 0 < N < 1  : relative width, percent of terminal width
  *
- *  @whint: N >= 1     : absolute width, empty column will be truncated to
+ * whint: N >= 1     : absolute width, empty column will be truncated to
  *                     the column header width if no specified STRICTWIDTH flag
+ * </programlisting>
+ * </informalexample>
  *
  * Note that if table has disabled "maxout" flag (disabled by default) than
  * relative width is used as a hint only. It's possible that column will be
@@ -384,12 +392,12 @@ int scols_table_move_column(struct libscols_table *tb,
  * If the width of all columns is greater than terminal width then library
  * tries to reduce width of the individual columns. It's done in three stages:
  *
- * #1 reduce columns with SCOLS_FL_TRUNC flag and with relative width if the
+ * 1. reduce columns with SCOLS_FL_TRUNC flag and with relative width if the
  *    width is greater than width defined by @whint (@whint * terminal_width)
  *
- * #2 reduce all columns with SCOLS_FL_TRUNC flag
+ * 2. reduce all columns with SCOLS_FL_TRUNC flag
  *
- * #3 reduce all columns with relative width
+ * 3. reduce all columns with relative width
  *
  * The next stage is always used if the previous stage is unsuccessful. Note
  * that SCOLS_FL_WRAP is interpreted as SCOLS_FL_TRUNC when calculate column
@@ -400,12 +408,16 @@ int scols_table_move_column(struct libscols_table *tb,
  * The column is necessary to address by sequential number. The first defined
  * column has the colnum = 0. For example:
  *
- *	scols_table_new_column(tab, "FOO", 0.5, 0);		// colnum = 0
- *	scols_table_new_column(tab, "BAR", 0.5, 0);		// colnum = 1
- *      .
- *      .
- *	scols_line_get_cell(line, 0);				// FOO column
- *	scols_line_get_cell(line, 1);				// BAR column
+ * <informalexample>
+ *   <programlisting language="C">
+ *     scols_table_new_column(tab, "FOO", 0.5, 0);    // colnum = 0
+ *     scols_table_new_column(tab, "BAR", 0.5, 0);    // colnum = 1
+ *     .
+ *     .
+ *     scols_line_get_cell(line, 0);                  // FOO column
+ *     scols_line_get_cell(line, 1);                  // BAR column
+ *   </programlisting>
+ * </informalexample>
  *
  * Returns: newly allocated column
  */
@@ -415,24 +427,18 @@ struct libscols_column *scols_table_new_column(struct libscols_table *tb,
 					       int flags)
 {
 	struct libscols_column *cl;
-	struct libscols_cell *hr;
 
 	if (!tb)
 		return NULL;
 
-	DBG(TAB, ul_debugobj(tb, "new column name=%s, whint=%g, flags=%d",
+	DBG(TAB, ul_debugobj(tb, "new column name=%s, whint=%g, flags=0x%04x",
 				name, whint, flags));
 	cl = scols_new_column();
 	if (!cl)
 		return NULL;
 
-	/* set column name */
-	hr = scols_column_get_header(cl);
-	if (!hr)
+	if (name && scols_column_set_name(cl, name))
 		goto err;
-	if (scols_cell_set_data(hr, name))
-		goto err;
-
 	scols_column_set_whint(cl, whint);
 	scols_column_set_flags(cl, flags);
 
@@ -527,6 +533,50 @@ size_t scols_table_get_nlines(const struct libscols_table *tb)
 	return tb->nlines;
 }
 
+
+int scols_table_set_cursor(struct libscols_table *tb,
+			   struct libscols_line *ln,
+			   struct libscols_column *cl,
+			   struct libscols_cell *ce)
+{
+	if (!tb)
+		return -EINVAL;
+
+	tb->cur_line = ln;
+	tb->cur_column = cl;
+	tb->cur_cell = ce;
+
+	return 0;
+}
+
+/**
+ * scols_table_get_cursor:
+ * @tb: table
+ * @ln: returns current line (optional)
+ * @cl: returns current column (optional)
+ * @ce: returns current cell (optional)
+ *
+ * Returns: 0 on success, negative number in case of error.
+ *
+ * Since: 2.40
+ */
+int scols_table_get_cursor(struct libscols_table *tb,
+			   struct libscols_line **ln,
+			   struct libscols_column **cl,
+			   struct libscols_cell **ce)
+{
+	if (!tb)
+		return -EINVAL;
+
+	if (ln)
+		*ln = tb->cur_line;
+	if (cl)
+		*cl = tb->cur_column;
+	if (ce)
+		*ce = tb->cur_cell;
+	return 0;
+}
+
 /**
  * scols_table_set_stream:
  * @tb: table
@@ -612,6 +662,44 @@ struct libscols_column *scols_table_get_column(struct libscols_table *tb,
 	}
 	return NULL;
 }
+
+/**
+ * scols_table_get_column_ny_name
+ * @tb: table
+ * @name: column name
+ *
+ * Returns: pointer to column or NULL
+ *
+ * Since: 2.39
+ */
+struct libscols_column *scols_table_get_column_by_name(
+				struct libscols_table *tb, const char *name)
+{
+	struct libscols_iter itr;
+	struct libscols_column *cl;
+
+	if (!tb || !name)
+		return NULL;
+
+	scols_reset_iter(&itr, SCOLS_ITER_FORWARD);
+	while (scols_table_next_column(tb, &itr, &cl) == 0) {
+		const char *cn = scols_column_get_name(cl);
+
+		if (cn && strcmp(cn, name) == 0)
+			return cl;
+	}
+
+	scols_reset_iter(&itr, SCOLS_ITER_FORWARD);
+	while (scols_table_next_column(tb, &itr, &cl) == 0) {
+		const char *cn = scols_column_get_name_as_shellvar(cl);
+
+		if (cn && strcmp(cn, name) == 0)
+			return cl;
+	}
+
+	return NULL;
+}
+
 
 /**
  * scols_table_add_line:
@@ -725,10 +813,13 @@ int scols_table_next_line(struct libscols_table *tb,
  *
  * This is shortcut for
  *
- *   ln = scols_new_line();
- *   scols_table_add_line(tb, ln);
- *   scols_line_add_child(parent, ln);
- *
+ * <informalexample>
+ *   <programlisting language="C">
+ *     ln = scols_new_line();
+ *     scols_table_add_line(tb, ln);
+ *     scols_line_add_child(parent, ln);
+ *   </programlisting>
+ * </informalexample>
  *
  * Returns: newly allocate line
  */
@@ -1078,9 +1169,11 @@ int scols_table_enable_json(struct libscols_table *tb, int enable)
  * Enable/disable export output format (COLUMNAME="value" ...).
  * The parsable output formats (export and raw) are mutually exclusive.
  *
- * Note that COLUMNAME maybe be modified on output to contains only chars
- * allowed as shell variable identifiers, for example MIN-IO and FSUSE% will be
- * MIN_IO and FSUSE_PCT.
+ * See also scols_table_enable_shellvar(). Note that in version 2.37 (and only
+ * in this version) scols_table_enable_shellvar() functionality has been
+ * automatically enabled  for "export" format. This behavior has been reverted
+ * in version 2.38 due to backward compatibility issues. Now it's necessary to
+ * explicitly call scols_table_enable_shellvar().
  *
  * Returns: 0 on success, negative number in case of an error.
  */
@@ -1096,6 +1189,29 @@ int scols_table_enable_export(struct libscols_table *tb, int enable)
 		tb->format = 0;
 	return 0;
 }
+
+/**
+ * scols_table_enable_shellvar:
+ * @tb: table
+ * @enable: 1 or 0
+ *
+ * Force library to print column names to be compatible with shell requirements
+ * to variable names.  For example "1FOO%" will be printed as "_1FOO_PCT".
+ *
+ * Returns: 0 on success, negative number in case of an error.
+ *
+ * Since: 2.38
+ */
+int scols_table_enable_shellvar(struct libscols_table *tb, int enable)
+{
+	if (!tb)
+		return -EINVAL;
+
+	DBG(TAB, ul_debugobj(tb, "shellvar: %s", enable ? "ENABLE" : "DISABLE"));
+	tb->is_shellvar = enable ? 1 : 0;
+	return 0;
+}
+
 
 /**
  * scols_table_enable_ascii:
@@ -1191,7 +1307,7 @@ int scols_table_enable_maxout(struct libscols_table *tb, int enable)
  *
  * Force library to terminate line after last column with data. The extra
  * padding is not added to the empty cells at the end of the line. The default is fill
- * tailing empty cells except the last line cell.
+ * trailing empty cells except the last line cell.
  *
  * This setting is mutually exclusive to scols_table_enable_maxout().
  *
@@ -1341,6 +1457,20 @@ int scols_table_is_header_repeat(const struct libscols_table *tb)
 int scols_table_is_export(const struct libscols_table *tb)
 {
 	return tb->format == SCOLS_FMT_EXPORT;
+}
+
+/**
+ * scols_table_is_shellvar:
+ * @tb: table
+ *
+ * Returns: 1 if column names has to be compatible with shell requirements
+ *          to variable names
+ *
+ * Since: 2.38
+ */
+int scols_table_is_shellvar(const struct libscols_table *tb)
+{
+	return tb->is_shellvar;
 }
 
 /**

@@ -131,6 +131,8 @@ struct script_control {
 
 	const char *ttyname;
 	const char *ttytype;
+	const char *command;
+	char *command_norm;	/* normalized (without \n) */
 	int ttycols;
 	int ttylines;
 
@@ -138,16 +140,16 @@ struct script_control {
 	pid_t child;		/* child pid */
 	int childstatus;	/* child process exit value */
 
-	unsigned int
-	 append:1,		/* append output */
-	 rc_wanted:1,		/* return child exit value */
-	 flush:1,		/* flush after each write */
-	 quiet:1,		/* suppress most output */
-	 force:1,		/* write output to links */
-	 isterm:1;		/* is child process running as terminal */
+	bool	append,		/* append output */
+		rc_wanted,	/* return child exit value */
+		flush,		/* flush after each write */
+		quiet,		/* suppress most output */
+		force,		/* write output to links */
+		isterm;		/* is child process running as terminal */
 };
 
-static ssize_t log_info(struct script_control *ctl, const char *name, const char *msgfmt, ...);
+static ssize_t log_info(struct script_control *ctl, const char *name, const char *msgfmt, ...)
+			__attribute__((__format__ (__printf__, 3, 4)));
 
 static void script_init_debug(void)
 {
@@ -213,8 +215,8 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" -q, --quiet                   be quiet\n"), out);
 
 	fputs(USAGE_SEPARATOR, out);
-	printf(USAGE_HELP_OPTIONS(31));
-	printf(USAGE_MAN_TAIL("script(1)"));
+	fprintf(out, USAGE_HELP_OPTIONS(31));
+	fprintf(out, USAGE_MAN_TAIL("script(1)"));
 
 	exit(EXIT_SUCCESS);
 }
@@ -257,8 +259,8 @@ static struct script_log *log_associate(struct script_control *ctl,
 	}
 
 	/* add log to the stream */
-	stream->logs = xrealloc(stream->logs,
-			(stream->nlogs + 1) * sizeof(log));
+	stream->logs = xreallocarray(stream->logs,
+			stream->nlogs + 1, sizeof(log));
 	stream->logs[stream->nlogs] = log;
 	stream->nlogs++;
 
@@ -388,23 +390,28 @@ static int log_start(struct script_control *ctl,
 	switch (log->format) {
 	case SCRIPT_FMT_RAW:
 	{
+		int x = 0;
 		char buf[FORMAT_TIMESTAMP_MAX];
 		time_t tvec = script_time((time_t *)NULL);
 
 		strtime_iso(&tvec, ISO_TIMESTAMP, buf, sizeof(buf));
 		fprintf(log->fp, _("Script started on %s ["), buf);
 
+		if (ctl->command)
+			x += fprintf(log->fp, "COMMAND=\"%s\"", ctl->command_norm);
+
 		if (ctl->isterm) {
 			init_terminal_info(ctl);
 
 			if (ctl->ttytype)
-				fprintf(log->fp, "TERM=\"%s\" ", ctl->ttytype);
+				x += fprintf(log->fp, "%*sTERM=\"%s\"", !!x, "", ctl->ttytype);
 			if (ctl->ttyname)
-				fprintf(log->fp, "TTY=\"%s\" ", ctl->ttyname);
+				x += fprintf(log->fp, "%*sTTY=\"%s\"", !!x, "", ctl->ttyname);
 
-			fprintf(log->fp, "COLUMNS=\"%d\" LINES=\"%d\"", ctl->ttycols, ctl->ttylines);
+			x += fprintf(log->fp, "%*sCOLUMNS=\"%d\" LINES=\"%d\"", !!x, "",
+					ctl->ttycols, ctl->ttylines);
 		} else
-			fprintf(log->fp, _("<not executed on terminal>"));
+			fprintf(log->fp, _("%*s<not executed on terminal>"), !!x, "");
 
 		fputs("]\n", log->fp);
 		break;
@@ -519,7 +526,8 @@ static ssize_t log_stream_activity(
 	return outsz;
 }
 
-static ssize_t log_signal(struct script_control *ctl, int signum, char *msgfmt, ...)
+static ssize_t __attribute__ ((__format__ (__printf__, 3, 4)))
+	log_signal(struct script_control *ctl, int signum, const char *msgfmt, ...)
 {
 	struct script_log *log;
 	struct timeval now, delta;
@@ -669,7 +677,7 @@ static int callback_log_stream_activity(void *data, int fd, char *buf, size_t bu
 	if (ssz < 0)
 		return (int) ssz;
 
-	DBG(IO, ul_debug(" append %ld bytes [summary=%zu, max=%zu]", ssz,
+	DBG(IO, ul_debug(" append %zd bytes [summary=%" PRIu64 ", max=%" PRIu64 "]", ssz,
 				ctl->outsz, ctl->maxsz));
 
 	ctl->outsz += ssz;
@@ -754,7 +762,7 @@ int main(int argc, char **argv)
 	struct ul_pty_callbacks *cb;
 	int ch, format = 0, caught_signal = 0, rc = 0, echo = 1;
 	const char *outfile = NULL, *infile = NULL;
-	const char *timingfile = NULL, *shell = NULL, *command = NULL;
+	const char *timingfile = NULL, *shell = NULL;
 
 	enum { FORCE_OPTION = CHAR_MAX + 1 };
 
@@ -809,7 +817,9 @@ int main(int argc, char **argv)
 			ctl.append = 1;
 			break;
 		case 'c':
-			command = optarg;
+			ctl.command = optarg;
+			ctl.command_norm = xstrdup(ctl.command);
+			strrep(ctl.command_norm, '\n', ' ');
 			break;
 		case 'E':
 			if (strcmp(optarg, "auto") == 0)
@@ -878,15 +888,24 @@ int main(int argc, char **argv)
 
 	/* default if no --log-* specified */
 	if (!outfile && !infile) {
-		if (argc > 0)
+		if (argc > 0) {
 			outfile = argv[0];
-		else {
+			argc--;
+			argv++;
+		} else {
 			die_if_link(&ctl, DEFAULT_TYPESCRIPT_FILENAME);
 			outfile = DEFAULT_TYPESCRIPT_FILENAME;
 		}
 
 		/* associate stdout with typescript file */
 		log_associate(&ctl, &ctl.out, outfile, SCRIPT_FMT_RAW);
+	}
+
+	if (argc > 0) {
+		/* only one filename is accepted. if --log-out was given,
+		 * freestanding filename is ignored */
+		warnx(_("unexpected number of arguments"));
+		errtryhelp(EXIT_FAILURE);
 	}
 
 	if (timingfile) {
@@ -936,13 +955,16 @@ int main(int argc, char **argv)
 		printf(_(".\n"));
 	}
 
-#ifdef HAVE_LIBUTEMPTER
-	utempter_add_record(ul_pty_get_childfd(ctl.pty), NULL);
-#endif
 
 	if (ul_pty_setup(ctl.pty))
 		err(EXIT_FAILURE, _("failed to create pseudo-terminal"));
 
+#ifdef HAVE_LIBUTEMPTER
+	utempter_add_record(ul_pty_get_childfd(ctl.pty), NULL);
+#endif
+
+	if (ul_pty_signals_setup(ctl.pty))
+		err(EXIT_FAILURE, _("failed to initialize signals handler"));
 	fflush(stdout);
 
 	/*
@@ -967,15 +989,15 @@ int main(int argc, char **argv)
 		shname = shname ? shname + 1 : shell;
 
 		if (access(shell, X_OK) == 0) {
-			if (command)
-				execl(shell, shname, "-c", command, (char *)NULL);
+			if (ctl.command)
+				execl(shell, shname, "-c", ctl.command, (char *)NULL);
 			else
 				execl(shell, shname, "-i", (char *)NULL);
 		} else {
-			if (command)
-				execlp(shname, "-c", command, (char *)NULL);
+			if (ctl.command)
+				execlp(shname, shname, "-c", ctl.command, (char *)NULL);
 			else
-				execlp(shname, "-i", (char *)NULL);
+				execlp(shname, shname, "-i", (char *)NULL);
 		}
 
 		err(EXIT_FAILURE, "failed to execute %s", shell);
@@ -998,18 +1020,18 @@ int main(int argc, char **argv)
 		time_t tvec = script_time((time_t *)NULL);
 
 		strtime_iso(&tvec, ISO_TIMESTAMP, buf, sizeof(buf));
-		log_info(&ctl, "START_TIME", buf);
+		log_info(&ctl, "START_TIME", "%s", buf);
 
 		if (ctl.isterm) {
 			init_terminal_info(&ctl);
-			log_info(&ctl, "TERM", ctl.ttytype);
-			log_info(&ctl, "TTY", ctl.ttyname);
+			log_info(&ctl, "TERM", "%s", ctl.ttytype);
+			log_info(&ctl, "TTY", "%s", ctl.ttyname);
 			log_info(&ctl, "COLUMNS", "%d", ctl.ttycols);
 			log_info(&ctl, "LINES", "%d", ctl.ttylines);
 		}
 		log_info(&ctl, "SHELL", "%s", shell);
-		if (command)
-			log_info(&ctl, "COMMAND", "%s", command);
+		if (ctl.command)
+			log_info(&ctl, "COMMAND", "%s", ctl.command_norm);
 		log_info(&ctl, "TIMING_LOG", "%s", timingfile);
 		if (outfile)
 			log_info(&ctl, "OUTPUT_LOG", "%s", outfile);

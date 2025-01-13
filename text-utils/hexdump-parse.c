@@ -78,7 +78,7 @@ void addfile(char *name, struct hexdump *hex)
 {
 	char *fmt, *buf = NULL;
 	FILE *fp;
-	size_t n;
+	size_t n = 0;
 
 	if ((fp = fopen(name, "r")) == NULL)
 	        err(EXIT_FAILURE, _("can't read %s"), name);
@@ -96,6 +96,18 @@ void addfile(char *name, struct hexdump *hex)
 
 	free(buf);
 	fclose(fp);
+}
+
+static char *next_number(const char *str, int *num)
+{
+	char *end = NULL;
+
+	errno = 0;
+	*num = strtol(str, &end, 10);
+
+	if (errno || !end || end == str)
+		return NULL;
+	return end;
 }
 
 void add_fmt(const char *fmt, struct hexdump *hex)
@@ -127,13 +139,11 @@ void add_fmt(const char *fmt, struct hexdump *hex)
 
 		/* If leading digit, repetition count. */
 		if (isdigit(*p)) {
-			savep = p;
-			while (isdigit(*p))
-				p++;
-			if (!isspace(*p) && *p != '/')
+			p = next_number(p, &tfu->reps);
+			if (!p || (!isspace(*p) && *p != '/'))
 				badfmt(fmt);
+
 			/* may overwrite either white space or slash */
-			tfu->reps = atoi(savep);
 			tfu->flags = F_SETREP;
 			/* skip trailing white space */
 			p = skip_space(++p);
@@ -145,12 +155,9 @@ void add_fmt(const char *fmt, struct hexdump *hex)
 
 		/* byte count */
 		if (isdigit(*p)) {
-			savep = p;
-			while (isdigit(*p))
-				p++;
-			if (!isspace(*p))
+			p = next_number(p, &tfu->bcnt);
+			if (!p || !isspace(*p))
 				badfmt(fmt);
-			tfu->bcnt = atoi(savep);
 			/* skip trailing white space */
 			p = skip_space(++p);
 		}
@@ -197,13 +204,12 @@ int block_size(struct hexdump_fs *fs)
 			 * skip any special chars -- save precision in
 			 * case it's a %s format.
 			 */
-			while (strchr(spec + 1, *++fmt))
+			while (strchr(spec + 1, *++fmt) && *fmt != '\0')
 				;
-			if (*fmt == '.' && isdigit(*++fmt)) {
-				prec = atoi(fmt);
-				while (isdigit(*++fmt))
-					;
-			}
+			if (*fmt == '.' && isdigit(*++fmt))
+				fmt = next_number(fmt, &prec);
+			if (*fmt == '\0')
+				badfmt(fu->fmt);
 			if (first_letter(fmt, "diouxX"))
 				bcnt += 4;
 			else if (first_letter(fmt, "efgEG"))
@@ -269,9 +275,7 @@ void rewrite_rules(struct hexdump_fs *fs, struct hexdump *hex)
 					;
 				if (*p1 == '.' && isdigit(*++p1)) {
 					sokay = USEPREC;
-					prec = atoi(p1);
-					while (isdigit(*++p1))
-						;
+					p1 = next_number(p1, &prec);
 				} else
 					sokay = NOTOKAY;
 			}
@@ -423,9 +427,7 @@ isint:				cs[3] = '\0';
 			 */
 			savech = *p2;
 			p1[0] = '\0';
-			pr->fmt = xmalloc(strlen(fmtp) + strlen(cs) + 1);
-			strcpy(pr->fmt, fmtp);
-			strcat(pr->fmt, cs);
+			xasprintf(&pr->fmt, "%s%s", fmtp, cs);
 			*p2 = savech;
 			pr->cchar = pr->fmt + (p1 - fmtp);
 			fmtp = p2;

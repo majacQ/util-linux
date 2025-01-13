@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <sys/types.h>
@@ -50,7 +51,7 @@
 #define EFI_PMBR_OSTYPE     0xEE
 #define MSDOS_MBR_SIGNATURE 0xAA55
 #define GPT_PART_NAME_LEN   (72 / sizeof(uint16_t))
-#define GPT_NPARTITIONS     FDISK_GPT_NPARTITIONS_DEFAULT
+#define GPT_NPARTITIONS     ((size_t) FDISK_GPT_NPARTITIONS_DEFAULT)
 
 /* Globally unique identifier */
 struct gpt_guid {
@@ -151,19 +152,20 @@ struct gpt_legacy_mbr {
 		.name = (_n),    \
 	}
 
-static struct fdisk_parttype gpt_parttypes[] =
+static const struct fdisk_parttype gpt_parttypes[] =
 {
 	#include "pt-gpt-partnames.h"
 };
 
 static const struct fdisk_shortcut gpt_parttype_cuts[] =
 {
-	{ .shortcut = "L", .alias = "linux", .data = "0FC63DAF-8483-4772-8E79-3D69D8477DE4" }, /* Linux */
-	{ .shortcut = "S", .alias = "swap",  .data = "0657FD6D-A4AB-43C4-84E5-0933C84B4F4F" }, /* Swap */
-	{ .shortcut = "H", .alias = "home",  .data = "933AC7E1-2EB4-4F13-B844-0E14E2AEF915" }, /* Home */
-	{ .shortcut = "U", .alias = "uefi",  .data = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B" }, /* UEFI system */
-	{ .shortcut = "R", .alias = "raid",  .data = "A19D880F-05FC-4D3B-A006-743F0F84911E" }, /* Linux RAID */
-	{ .shortcut = "V", .alias = "lvm",   .data = "E6D6D379-F507-44C2-A23C-238F2A3DF928" }  /* LVM */
+	{ .shortcut = "L", .alias = "linux",    .data = "0FC63DAF-8483-4772-8E79-3D69D8477DE4" }, /* Linux */
+	{ .shortcut = "S", .alias = "swap",     .data = "0657FD6D-A4AB-43C4-84E5-0933C84B4F4F" }, /* Swap */
+	{ .shortcut = "H", .alias = "home",     .data = "933AC7E1-2EB4-4F13-B844-0E14E2AEF915" }, /* Home */
+	{ .shortcut = "U", .alias = "uefi",     .data = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B" }, /* UEFI system */
+	{ .shortcut = "R", .alias = "raid",     .data = "A19D880F-05FC-4D3B-A006-743F0F84911E" }, /* Linux RAID */
+	{ .shortcut = "V", .alias = "lvm",      .data = "E6D6D379-F507-44C2-A23C-238F2A3DF928" }, /* LVM */
+	{ .shortcut = "X", .alias = "xbootldr", .data = "BC13C2FF-59E6-4262-A352-B275FD6F7172" }, /* Linux extended boot */
 };
 
 #define alignment_required(_x)  ((_x)->grain != (_x)->sector_size)
@@ -877,9 +879,9 @@ static int gpt_mknew_header(struct fdisk_context *cxt,
 	if (!has_id) {
 		struct gpt_guid guid;
 
-		uuid_generate_random((unsigned char *) &header->disk_guid);
-		guid = header->disk_guid;
+		uuid_generate_random((unsigned char *) &guid);
 		swap_efi_guid(&guid);
+		header->disk_guid = guid;
 	}
 	return 0;
 }
@@ -951,7 +953,7 @@ static int valid_pmbr(struct fdisk_context *cxt)
 
 			fdisk_warnx(cxt, _("GPT PMBR size mismatch (%"PRIu64" != %"PRIu64") "
 					   "will be corrected by write."),
-					sz_lba, cxt->total_sectors - 1ULL);
+					sz_lba, cxt->total_sectors - (uint64_t) 1);
 
 			/* Note that gpt_write_pmbr() overwrites PMBR, but we want to keep it valid already
 			 * in memory too to disable warnings when valid_pmbr() called next time */
@@ -1016,11 +1018,6 @@ static unsigned char *gpt_read_entries(struct fdisk_context *cxt,
 
 	if (gpt_sizeof_entries(header, &sz))
 		return NULL;
-
-	if (sz > (size_t) SSIZE_MAX) {
-		DBG(GPT, ul_debug("entries array too large to read()"));
-		return NULL;
-	}
 
 	ret = calloc(1, sz);
 	if (!ret)
@@ -1282,6 +1279,7 @@ static int gpt_get_disklabel_item(struct fdisk_context *cxt, struct fdisk_labeli
 {
 	struct gpt_header *h;
 	int rc = 0;
+	uint64_t x = 0;
 
 	assert(cxt);
 	assert(cxt->label);
@@ -1298,12 +1296,12 @@ static int gpt_get_disklabel_item(struct fdisk_context *cxt, struct fdisk_labeli
 			rc = -ENOMEM;
 		break;
 	case GPT_LABELITEM_FIRSTLBA:
-		item->name = _("First LBA");
+		item->name = _("First usable LBA");
 		item->type = 'j';
 		item->data.num64 = le64_to_cpu(h->first_usable_lba);
 		break;
 	case GPT_LABELITEM_LASTLBA:
-		item->name = _("Last LBA");
+		item->name = _("Last usable LBA");
 		item->type = 'j';
 		item->data.num64 = le64_to_cpu(h->last_usable_lba);
 		break;
@@ -1315,9 +1313,17 @@ static int gpt_get_disklabel_item(struct fdisk_context *cxt, struct fdisk_labeli
 		break;
 	case GPT_LABELITEM_ENTRIESLBA:
 		/* TRANSLATORS: The start of the array of partition entries. */
-		item->name = _("Partition entries LBA");
+		item->name = _("Partition entries starting LBA");
 		item->type = 'j';
 		item->data.num64 = le64_to_cpu(h->partition_entry_lba);
+		break;
+	case GPT_LABELITEM_ENTRIESLASTLBA:
+		/* TRANSLATORS: The end of the array of partition entries. */
+		item->name = _("Partition entries ending LBA");
+		item->type = 'j';
+		gpt_calculate_sectorsof_entries(h,
+				le32_to_cpu(h->npartition_entries), &x, cxt);
+		item->data.num64 = le64_to_cpu(h->partition_entry_lba) + x - 1;
 		break;
 	case GPT_LABELITEM_ENTRIESALLOC:
 		item->name = _("Allocated partition entries");
@@ -2014,6 +2020,19 @@ static int gpt_set_partition(struct fdisk_context *cxt, size_t n,
 	return rc;
 }
 
+static int gpt_read(struct fdisk_context *cxt, off_t offset, void *buf, size_t count)
+{
+	if (offset != lseek(cxt->dev_fd, offset, SEEK_SET))
+		return -errno;
+
+	if (read_all(cxt->dev_fd, buf, count))
+		return -errno;
+
+	DBG(GPT, ul_debug("  read OK [offset=%zu, size=%zu]",
+				(size_t) offset, count));
+	return 0;
+}
+
 static int gpt_write(struct fdisk_context *cxt, off_t offset, void *buf, size_t count)
 {
 	if (offset != lseek(cxt->dev_fd, offset, SEEK_SET))
@@ -2022,7 +2041,8 @@ static int gpt_write(struct fdisk_context *cxt, off_t offset, void *buf, size_t 
 	if (write_all(cxt->dev_fd, buf, count))
 		return -errno;
 
-	fsync(cxt->dev_fd);
+	if (fsync(cxt->dev_fd) != 0)
+		return -errno;
 
 	DBG(GPT, ul_debug("  write OK [offset=%zu, size=%zu]",
 				(size_t) offset, count));
@@ -2069,6 +2089,8 @@ static int gpt_write_header(struct fdisk_context *cxt,
 static int gpt_write_pmbr(struct fdisk_context *cxt)
 {
 	struct gpt_legacy_mbr *pmbr;
+	struct gpt_legacy_mbr *current;
+	int rc;
 
 	assert(cxt);
 	assert(cxt->firstsector);
@@ -2097,6 +2119,25 @@ static int gpt_write_pmbr(struct fdisk_context *cxt)
 		pmbr->partition_record[0].size_in_lba =
 			cpu_to_le32((uint32_t) (cxt->total_sectors - 1ULL));
 
+	/* Read the current PMBR and compare it with the new, don't write if
+	 * the same. */
+	current = malloc(sizeof(*current));
+	if (!current)
+		goto do_write;
+
+	rc = gpt_read(cxt, GPT_PMBR_LBA * cxt->sector_size,
+		      current, sizeof(*current));
+	if (!rc)
+		rc = memcmp(pmbr, current, sizeof(*current));
+
+	free(current);
+
+	if (!rc) {
+		DBG(GPT, ul_debug("Same MBR on disk => don't write it"));
+		return 0;
+	}
+
+ do_write:
 	/* pMBR covers the first sector (LBA) of the disk */
 	return gpt_write(cxt, GPT_PMBR_LBA * cxt->sector_size,
 			 pmbr, cxt->sector_size);
@@ -2287,7 +2328,7 @@ static int gpt_verify_disklabel(struct fdisk_context *cxt)
 			   P_("A total of %ju free sectors is available in %u segment.",
 			      "A total of %ju free sectors is available in %u segments "
 			      "(the largest is %s).", nsegments),
-			   free_sectors, nsegments, strsz);
+			   free_sectors, nsegments, strsz ? : "0 B");
 		free(strsz);
 
 	} else
@@ -2336,7 +2377,7 @@ static int gpt_add_partition(
 {
 	uint64_t user_f, user_l;	/* user input ranges for first and last sectors */
 	uint64_t disk_f, disk_l;	/* first and last available sector ranges on device*/
-	uint64_t dflt_f, dflt_l;	/* largest segment (default) */
+	uint64_t dflt_f, dflt_l, max_l;	/* largest segment (default) */
 	struct gpt_guid typeid;
 	struct fdisk_gpt_label *gpt;
 	struct gpt_header *pheader;
@@ -2418,6 +2459,14 @@ static int gpt_add_partition(
 	dflt_f = find_first_in_largest(gpt);
 	dflt_l = find_last_free(gpt, dflt_f);
 
+	/* don't offer too small free space by default, this is possible to
+	 * bypass by sfdisk script */
+	if ((!pa || !fdisk_partition_has_start(pa))
+	    && dflt_l - dflt_f + 1 < cxt->grain / cxt->sector_size) {
+		fdisk_warnx(cxt, _("No enough free sectors available."));
+		return -ENOSPC;
+	}
+
 	/* align the default in range <dflt_f,dflt_l>*/
 	dflt_f = fdisk_align_lba_in_range(cxt, dflt_f, dflt_f, dflt_l);
 
@@ -2464,15 +2513,23 @@ static int gpt_add_partition(
 
 
 	/* Last sector */
-	dflt_l = find_last_free(gpt, user_f);
+	dflt_l = max_l = find_last_free(gpt, user_f);
+
+	/* Make sure the last partition has aligned size by default because
+	 * range specified by LastUsableLBA may be unaligned on disks where
+	 * logical sector != physical (512/4K) because backup header size is
+	 * calculated from logical sectors. */
+	if (max_l == le64_to_cpu(gpt->pheader->last_usable_lba))
+		dflt_l = fdisk_align_lba_in_range(cxt, max_l, user_f, max_l) - 1;
 
 	if (pa && pa->end_follow_default) {
 		user_l = dflt_l;
 
 	} else if (pa && fdisk_partition_has_size(pa)) {
 		user_l = user_f + pa->size - 1;
-		DBG(GPT, ul_debug("size defined: %ju, end: %"PRIu64" (last possible: %"PRIu64")",
-					 (uintmax_t)pa->size, user_l, dflt_l));
+		DBG(GPT, ul_debug("size defined: %ju, end: %"PRIu64
+				  "(last possible: %"PRIu64", optimal: %"PRIu64")",
+				(uintmax_t)pa->size, user_l, max_l, dflt_l));
 
 		if (user_l != dflt_l
 		    && !pa->size_explicit
@@ -2496,7 +2553,7 @@ static int gpt_add_partition(
 			fdisk_ask_set_type(ask, FDISK_ASKTYPE_OFFSET);
 			fdisk_ask_number_set_low(ask,     user_f);	/* minimal */
 			fdisk_ask_number_set_default(ask, dflt_l);	/* default */
-			fdisk_ask_number_set_high(ask,    dflt_l);	/* maximal */
+			fdisk_ask_number_set_high(ask,    max_l);	/* maximal */
 			fdisk_ask_number_set_base(ask,    user_f);	/* base for relative input */
 			fdisk_ask_number_set_unit(ask,    cxt->sector_size);
 			fdisk_ask_number_set_wrap_negative(ask, 1);	/* wrap negative around high */
@@ -2565,9 +2622,9 @@ static int gpt_add_partition(
 		 */
 		struct gpt_guid guid;
 
-		uuid_generate_random((unsigned char *) &e->partition_guid);
-		guid = e->partition_guid;
+		uuid_generate_random((unsigned char *) &guid);
 		swap_efi_guid(&guid);
+		e->partition_guid = guid;
 	}
 
 	if (pa && pa->name && *pa->name)
@@ -2677,7 +2734,7 @@ static int gpt_create_disklabel(struct fdisk_context *cxt)
 	fdisk_info(cxt, _("Created a new GPT disklabel (GUID: %s)."), str);
 
 	if (gpt_get_nentries(gpt) < GPT_NPARTITIONS)
-		fdisk_info(cxt, _("The maximal number of partitions is %d (default is %d)."),
+		fdisk_info(cxt, _("The maximal number of partitions is %zu (default is %zu)."),
 				gpt_get_nentries(gpt), GPT_NPARTITIONS);
 done:
 	return rc;
@@ -2758,7 +2815,7 @@ static int gpt_check_table_overlap(struct fdisk_context *cxt,
 		}
 		if (gpt_partition_end(e) > last_usable) {
 			fdisk_warnx(cxt, _("Partition #%zu out of range (maximal end is %"PRIu64" sectors)"),
-		                    i + 1, last_usable - 1ULL);
+		                    i + 1, last_usable - (uint64_t) 1);
 			rc = -EINVAL;
 		}
 	}
@@ -2770,7 +2827,7 @@ static int gpt_check_table_overlap(struct fdisk_context *cxt,
  * @cxt: context
  * @nents: number of wanted entries
  *
- * Elarge GPT entries array if possible. The function check if an existing
+ * Enlarge GPT entries array if possible. The function check if an existing
  * partition does not overlap the entries array area. If yes, then it report
  * warning and returns -EINVAL.
  *
@@ -2806,7 +2863,7 @@ int fdisk_gpt_set_npartitions(struct fdisk_context *cxt, uint32_t nents)
 			fdisk_warnx(cxt, _("The partition entry size is zero."));
 		else
 			fdisk_warnx(cxt, _("The number of the partition has to be smaller than %zu."),
-				UINT32_MAX / entry_size);
+				(size_t) UINT32_MAX / entry_size);
 		return rc;
 	}
 
@@ -2858,7 +2915,7 @@ int fdisk_gpt_set_npartitions(struct fdisk_context *cxt, uint32_t nents)
 	/* update library info */
 	cxt->label->nparts_max = gpt_get_nentries(gpt);
 
-	fdisk_info(cxt, _("Partition table length changed from %"PRIu32" to %"PRIu64"."),
+	fdisk_info(cxt, _("Partition table length changed from %"PRIu32" to %"PRIu32"."),
 			old_nents, nents);
 
 	fdisk_label_set_changed(cxt->label, 1);
@@ -3096,10 +3153,8 @@ static int gpt_reorder(struct fdisk_context *cxt)
 				(const void *) gpt_get_entry(gpt, i),
 				(const void *) gpt_get_entry(gpt, i + 1)) > 0;
 
-	if (!mess) {
-		fdisk_info(cxt, _("Nothing to do. Ordering is correct already."));
+	if (!mess)
 		return 1;
-	}
 
 	qsort(gpt->ents, nparts, sizeof(struct gpt_entry),
 			gpt_entry_cmp_start);
@@ -3130,8 +3185,11 @@ static int gpt_reset_alignment(struct fdisk_context *cxt)
 	} else {
 		/* estimate ranges for GPT */
 		uint64_t first, last;
+		int rc;
 
-		count_first_last_lba(cxt, &first, &last, NULL);
+		rc = count_first_last_lba(cxt, &first, &last, NULL);
+		if (rc)
+			return rc;
 		if (cxt->first_lba < first)
 			cxt->first_lba = first;
 		if (cxt->last_lba > last)
@@ -3268,8 +3326,12 @@ void fdisk_gpt_enable_minimize(struct fdisk_label *lb, int enable)
 }
 
 #ifdef TEST_PROGRAM
-static int test_getattr(struct fdisk_test *ts, int argc, char *argv[])
+static int test_getattr(struct fdisk_test *ts __attribute__((unused)),
+			int argc, char *argv[])
 {
+	if (argc != 3)
+		return -1;
+
 	const char *disk = argv[1];
 	size_t part = strtoul(argv[2], NULL, 0) - 1;
 	struct fdisk_context *cxt;
@@ -3290,8 +3352,12 @@ static int test_getattr(struct fdisk_test *ts, int argc, char *argv[])
 	return 0;
 }
 
-static int test_setattr(struct fdisk_test *ts, int argc, char *argv[])
+static int test_setattr(struct fdisk_test *ts __attribute__((unused)),
+			int argc, char *argv[])
 {
+	if (argc != 4)
+		return -1;
+
 	const char *disk = argv[1];
 	size_t part = strtoul(argv[2], NULL, 0) - 1;
 	uint64_t atters = strtoull(argv[3], NULL, 0);

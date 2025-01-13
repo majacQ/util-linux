@@ -1,16 +1,18 @@
 /*
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
  * cfdisk.c - Display or manipulate a disk partition table.
  *
- *     Copyright (C) 2014-2015 Karel Zak <kzak@redhat.com>
+ *     Copyright (C) 2014-2023 Karel Zak <kzak@redhat.com>
  *     Copyright (C) 1994 Kevin E. Martin (martin@cs.unc.edu)
  *
  *     The original cfdisk was inspired by the fdisk program
  *           by A. V. Le Blanc (leblanc@mcc.ac.uk.
- *
- * cfdisk is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
  */
 #include <stdlib.h>
 #include <stdio.h>
@@ -21,6 +23,7 @@
 #include <assert.h>
 #include <libsmartcols.h>
 #include <sys/ioctl.h>
+#include <rpmatch.h>
 #include <libfdisk.h>
 
 #ifdef HAVE_LIBMOUNT
@@ -66,7 +69,7 @@
 #include "list.h"
 #include "blkdev.h"
 
-static const char *default_disks[] = {
+static const char *const default_disks[] = {
 #ifdef __GNU__
 		"/dev/hd0",
 		"/dev/sd0",
@@ -124,12 +127,14 @@ enum {
 	CFDISK_CL_FREESPACE,
 	CFDISK_CL_INFO
 };
+#ifdef HAVE_USE_DEFAULT_COLORS
 static const int color_pairs[][2] = {
 	/* color            foreground, background */
 	[CFDISK_CL_WARNING]   = { COLOR_RED, -1 },
 	[CFDISK_CL_FREESPACE] = { COLOR_GREEN, -1 },
 	[CFDISK_CL_INFO]      = { COLOR_BLUE, -1 }
 };
+#endif
 
 struct cfdisk;
 
@@ -141,9 +146,14 @@ static void menu_refresh_size(struct cfdisk *cf);
 
 static int ui_end(void);
 static int ui_refresh(struct cfdisk *cf);
-static void ui_warnx(const char *fmt, ...);
-static void ui_warn(const char *fmt, ...);
-static void ui_info(const char *fmt, ...);
+
+static void ui_warnx(const char *fmt, ...)
+			__attribute__((__format__ (__printf__, 1, 2)));
+static void ui_warn(const char *fmt, ...)
+			__attribute__((__format__ (__printf__, 1, 2)));
+static void ui_info(const char *fmt, ...)
+			__attribute__((__format__ (__printf__, 1, 2)));
+
 static void ui_draw_menu(struct cfdisk *cf);
 static int ui_menu_move(struct cfdisk *cf, int key);
 static void ui_menu_resize(struct cfdisk *cf);
@@ -201,14 +211,6 @@ static struct cfdisk_menuitem main_menuitems[] = {
 	{ 0, NULL, NULL }
 };
 
-/* extra partinfo in name:value pairs */
-struct cfdisk_extra {
-	char *name;
-	char *data;
-
-	struct list_head exs;
-};
-
 /* line and extra partinfo list_head */
 struct cfdisk_line {
 	char			*data;		/* line data */
@@ -245,10 +247,10 @@ struct cfdisk {
 	struct libmnt_table *fstab;
 	struct libmnt_cache *mntcache;
 #endif
-	unsigned int	wrong_order :1,		/* PT not in right order */
-			zero_start :1,		/* ignore existing partition table */
-			device_is_used : 1,	/* don't use re-read ioctl */
-			show_extra :1;		/* show extra partinfo */
+	bool	wrong_order,	/* PT not in right order */
+		zero_start,	/* ignore existing partition table */
+		device_is_used,	/* don't use re-read ioctl */
+		show_extra;	/* show extra partinfo */
 };
 
 
@@ -630,13 +632,13 @@ static int ask_callback(struct fdisk_context *cxt __attribute__((__unused__)),
 
 	switch(fdisk_ask_get_type(ask)) {
 	case FDISK_ASKTYPE_INFO:
-		ui_info(fdisk_ask_print_get_mesg(ask));
+		ui_info("%s", fdisk_ask_print_get_mesg(ask));
 		break;
 	case FDISK_ASKTYPE_WARNX:
-		ui_warnx(fdisk_ask_print_get_mesg(ask));
+		ui_warnx("%s", fdisk_ask_print_get_mesg(ask));
 		break;
 	case FDISK_ASKTYPE_WARN:
-		ui_warn(fdisk_ask_print_get_mesg(ask));
+		ui_warn("%s", fdisk_ask_print_get_mesg(ask));
 		break;
 	case FDISK_ASKTYPE_MENU:
 		ask_menu(ask, (struct cfdisk *) data);
@@ -668,7 +670,8 @@ static int ui_end(void)
 	return 0;
 }
 
-static void ui_vprint_center(size_t line, int attrs, const char *fmt, va_list ap)
+static void __attribute__((__format__ (__printf__, 3, 0)))
+	ui_vprint_center(size_t line, int attrs, const char *fmt, va_list ap)
 {
 	size_t width;
 	char *buf = NULL;
@@ -698,7 +701,8 @@ static void ui_vprint_center(size_t line, int attrs, const char *fmt, va_list ap
 	free(buf);
 }
 
-static void ui_center(size_t line, const char *fmt, ...)
+static void __attribute__((__format__ (__printf__, 2, 3)))
+	ui_center(size_t line, const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
@@ -706,7 +710,8 @@ static void ui_center(size_t line, const char *fmt, ...)
 	va_end(ap);
 }
 
-static void ui_warnx(const char *fmt, ...)
+static void __attribute__((__format__ (__printf__, 1, 2)))
+	ui_warnx(const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
@@ -721,7 +726,8 @@ static void ui_warnx(const char *fmt, ...)
 	va_end(ap);
 }
 
-static void ui_warn(const char *fmt, ...)
+static void __attribute__((__format__ (__printf__, 1, 2)))
+	ui_warn(const char *fmt, ...)
 {
 	char *fmt_m;
 	va_list ap;
@@ -747,8 +753,10 @@ static void ui_clean_warn(void)
 	clrtoeol();
 }
 
-static int __attribute__((__noreturn__)) ui_err(int rc, const char *fmt, ...)
-		{
+static int __attribute__((__noreturn__))
+	   __attribute__((__format__ (__printf__, 2, 3)))
+	ui_err(int rc, const char *fmt, ...)
+{
 	va_list ap;
 	ui_end();
 
@@ -761,7 +769,9 @@ static int __attribute__((__noreturn__)) ui_err(int rc, const char *fmt, ...)
 	exit(rc);
 }
 
-static int __attribute__((__noreturn__)) ui_errx(int rc, const char *fmt, ...)
+static int __attribute__((__noreturn__))
+	   __attribute__((__format__ (__printf__, 2, 3)))
+	ui_errx(int rc, const char *fmt, ...)
 		{
 	va_list ap;
 	ui_end();
@@ -775,7 +785,8 @@ static int __attribute__((__noreturn__)) ui_errx(int rc, const char *fmt, ...)
 	exit(rc);
 }
 
-static void ui_info(const char *fmt, ...)
+static void __attribute__((__format__ (__printf__, 1, 2)))
+	ui_info(const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
@@ -796,7 +807,8 @@ static void ui_clean_info(void)
 	clrtoeol();
 }
 
-static void ui_hint(const char *fmt, ...)
+static void __attribute__((__format__ (__printf__, 1, 2)))
+	ui_hint(const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
@@ -1130,7 +1142,7 @@ static void ui_draw_menuitem(struct cfdisk *cf,
 	if (cf->menu->idx == idx) {
 		standend();
 		if (d->desc)
-			ui_hint(_(d->desc));
+			ui_hint("%s", _(d->desc));
 	}
 }
 
@@ -1307,6 +1319,34 @@ static char *get_mountpoint(struct cfdisk *cf, const char *tagname, const char *
 }
 #endif /* HAVE_LIBMOUNT */
 
+static inline int iszero(const char *str)
+{
+	const char *p;
+
+	for (p = str; p && *p == '0'; p++);
+
+	return !p || *p == '\0';
+}
+
+static int has_uuid(struct fdisk_table *tb, const char *uuid)
+{
+	struct fdisk_partition *pa;
+	struct fdisk_iter *itr;
+	int rc = 0;
+
+	if (!tb || !uuid || fdisk_table_is_empty(tb))
+		return 0;
+
+	itr = fdisk_new_iter(FDISK_ITER_FORWARD);
+	while (rc == 0 && fdisk_table_next_partition(tb, itr, &pa) == 0) {
+		const char *x = fdisk_partition_get_uuid(pa);
+		if (x)
+			rc = strcmp(x, uuid) == 0;
+	}
+	fdisk_free_iter(itr);
+	return rc;
+}
+
 static void extra_prepare_data(struct cfdisk *cf)
 {
 	struct fdisk_partition *pa = get_current_partition(cf);
@@ -1326,7 +1366,14 @@ static void extra_prepare_data(struct cfdisk *cf)
 
 	if (!fdisk_partition_to_string(pa, cf->cxt, FDISK_FIELD_UUID, &data) && data) {
 		extra_insert_pair(l, _("Partition UUID:"), data);
-		if (!mountpoint)
+
+		/* Search for mountpoint by PARTUUID= means that we need to
+		 * check fstab and convert PARTUUID to the device name. This is
+		 * unnecessary and overkill for newly created partitions. Let's
+		 * check if the UUID already exist in the old layout, otherwise
+		 * ignore it.
+		 */
+		if (!mountpoint && has_uuid(cf->original_layout, data))
 			mountpoint = get_mountpoint(cf, "PARTUUID", data);
 		free(data);
 	}
@@ -1350,19 +1397,19 @@ static void extra_prepare_data(struct cfdisk *cf)
 
 	/* for numeric data, only show non-zero rows */
 	if (!fdisk_partition_to_string(pa, cf->cxt, FDISK_FIELD_BSIZE, &data) && data) {
-		if (atoi(data))
+		if (!iszero(data))
 			extra_insert_pair(l, "BSIZE:", data);
 		free(data);
 	}
 
 	if (!fdisk_partition_to_string(pa, cf->cxt, FDISK_FIELD_CPG, &data) && data) {
-		if (atoi(data))
+		if (!iszero(data))
 			extra_insert_pair(l, "CPG:", data);
 		free(data);
 	}
 
 	if (!fdisk_partition_to_string(pa, cf->cxt, FDISK_FIELD_FSIZE, &data) && data) {
-		if (atoi(data))
+		if (!iszero(data))
 			extra_insert_pair(l, "FSIZE:", data);
 		free(data);
 	}
@@ -1686,6 +1733,8 @@ static int ui_table_goto(struct cfdisk *cf, int where)
 
 	if (where < 0)
 		where = 0;
+	if (!nparts)
+		where = 0;
 	else if ((size_t) where > nparts - 1)
 		where = nparts - 1;
 
@@ -1778,7 +1827,7 @@ static ssize_t ui_get_string(const char *prompt,
 	mbs_edit_goto(edit, MBS_EDIT_END);
 
 	if (hint)
-		ui_hint(hint);
+		ui_hint("%s", hint);
 	else
 		ui_clean_hint();
 
@@ -2030,7 +2079,7 @@ done:
 	}
 	free(cm);
 	DBG(UI, ul_debug("get parrtype done [type=%s] ", t ?
-				fdisk_parttype_get_name(t) : NULL));
+				fdisk_parttype_get_name(t) : ""));
 	return t;
 }
 
@@ -2198,13 +2247,14 @@ done:
 static int ui_help(void)
 {
 	size_t i;
-	static const char *help[] = {
+	static const char *const help[] = {
 		N_("This is cfdisk, a curses-based disk partitioning program."),
 		N_("It lets you create, delete, and modify partitions on a block device."),
 		"  ",
 		N_("Command      Meaning"),
 		N_("-------      -------"),
-		N_("  b          Toggle bootable flag of the current partition"),
+		N_("  b          Toggle bootable flag of the current partition;"),
+		N_("               implemented for DOS (MBR) and SGI labels only"),
 		N_("  d          Delete the current partition"),
 		N_("  h          Print this screen"),
 		N_("  n          Create new partition from free space"),
@@ -2228,7 +2278,7 @@ static int ui_help(void)
 		N_("Use lsblk(8) or partx(8) to see more details about the device."),
 		"  ",
 		"  ",
-		"Copyright (C) 2014-2017 Karel Zak <kzak@redhat.com>"
+		"Copyright (C) 2014-2023 Karel Zak <kzak@redhat.com>"
 	};
 
 	erase();
@@ -2402,18 +2452,17 @@ static int main_menu_action(struct cfdisk *cf, int key)
 	}
 	case 'r': /* resize */
 	{
-		struct fdisk_partition *npa, *next;
 		uint64_t size, max_size, secs;
+		struct fdisk_partition *npa;
 
 		if (fdisk_partition_is_freespace(pa) || !fdisk_partition_has_start(pa))
 			return -EINVAL;
 
-		size = fdisk_partition_get_size(pa);
-
-		/* is the next freespace? */
-		next = fdisk_table_get_partition(cf->table, cf->lines_idx + 1);
-		if (next && fdisk_partition_is_freespace(next))
-			size += fdisk_partition_get_size(next);
+		rc = fdisk_partition_get_max_size(cf->cxt,
+						  fdisk_partition_get_partno(pa),
+						  &size);
+		if (rc)
+			return rc;
 
 		size *= fdisk_get_sector_size(cf->cxt);
 		max_size = size;
@@ -2471,11 +2520,15 @@ static int main_menu_action(struct cfdisk *cf, int key)
 		if (rc)
 			warn = _("Failed to write disklabel.");
 		else {
+			size_t q_idx = 0;
+
 			if (cf->device_is_used)
 				fdisk_reread_changes(cf->cxt, cf->original_layout);
 			else
 				fdisk_reread_partition_table(cf->cxt);
 			info = _("The partition table has been altered.");
+			if (menu_get_menuitem_by_key(cf, 'q', &q_idx))
+				ui_menu_goto(cf, q_idx);
 		}
 		cf->nwrites++;
 		break;
@@ -2535,11 +2588,17 @@ static int ui_run(struct cfdisk *cf)
 	DBG(UI, ul_debug("start cols=%zu, lines=%zu", ui_cols, ui_lines));
 
 	if (fdisk_get_collision(cf->cxt)) {
-		ui_warnx(_("Device already contains a %s signature; it will be removed by a write command."),
-				fdisk_get_collision(cf->cxt));
-		fdisk_enable_wipe(cf->cxt, 1);
-		ui_hint(_("Press a key to continue."));
-		getch();
+		ui_warnx(_("Device already contains a %s signature."), fdisk_get_collision(cf->cxt));
+		if (fdisk_is_readonly(cf->cxt)) {
+			ui_hint(_("Press a key to continue."));
+			getch();
+		} else {
+			char buf[64] = { 0 };
+			rc = ui_get_string(_("Do you want to remove it? [Y]es/[N]o: "), NULL,
+					buf, sizeof(buf));
+			fdisk_enable_wipe(cf->cxt,
+					rc > 0 && rpmatch(buf) == RPMATCH_YES ? 1 : 0);
+		}
 	}
 
 	if (!fdisk_has_label(cf->cxt) || cf->zero_start) {
@@ -2672,10 +2731,12 @@ static void __attribute__((__noreturn__)) usage(void)
 	      _("     --lock[=<mode>]      use exclusive device lock (%s, %s or %s)\n"), "yes", "no", "nonblock");
 	fputs(_(" -r, --read-only          forced open cfdisk in read-only mode\n"), out);
 
-	fputs(USAGE_SEPARATOR, out);
-	printf(USAGE_HELP_OPTIONS(26));
+	fputs(_(" -b, --sector-size <size> physical and logical sector size\n"), out);
 
-	printf(USAGE_MAN_TAIL("cfdisk(8)"));
+	fputs(USAGE_SEPARATOR, out);
+	fprintf(out, USAGE_HELP_OPTIONS(26));
+
+	fprintf(out, USAGE_MAN_TAIL("cfdisk(8)"));
 	exit(EXIT_SUCCESS);
 }
 
@@ -2684,6 +2745,7 @@ int main(int argc, char *argv[])
 	const char *diskpath = NULL, *lockmode = NULL;
 	int rc, c, colormode = UL_COLORMODE_UNDEF;
 	int read_only = 0;
+	size_t user_ss = 0;
 	struct cfdisk _cf = { .lines_idx = 0 },
 		      *cf = &_cf;
 	enum {
@@ -2693,6 +2755,7 @@ int main(int argc, char *argv[])
 		{ "color",   optional_argument, NULL, 'L' },
 		{ "lock",    optional_argument, NULL, OPT_LOCK },
 		{ "help",    no_argument,       NULL, 'h' },
+		{ "sector-size", required_argument, NULL, 'b' },
 		{ "version", no_argument,       NULL, 'V' },
 		{ "zero",    no_argument,	NULL, 'z' },
 		{ "read-only", no_argument,     NULL, 'r' },
@@ -2704,8 +2767,15 @@ int main(int argc, char *argv[])
 	textdomain(PACKAGE);
 	close_stdout_atexit();
 
-	while((c = getopt_long(argc, argv, "L::hVzr", longopts, NULL)) != -1) {
+	while((c = getopt_long(argc, argv, "b:L::hVzr", longopts, NULL)) != -1) {
 		switch(c) {
+		case 'b':
+			user_ss = strtou32_or_err(optarg,
+					_("invalid sector size argument"));
+			if (user_ss != 512 && user_ss != 1024 &&
+			    user_ss != 2048 && user_ss != 4096)
+				errx(EXIT_FAILURE, _("invalid sector size argument"));
+			break;
 		case 'h':
 			usage();
 			break;
@@ -2744,6 +2814,8 @@ int main(int argc, char *argv[])
 	cf->cxt = fdisk_new_context();
 	if (!cf->cxt)
 		err(EXIT_FAILURE, _("failed to allocate libfdisk context"));
+	if (user_ss)
+		fdisk_save_user_sector_size(cf->cxt, user_ss, user_ss);
 
 	fdisk_set_ask(cf->cxt, ask_callback, (void *) cf);
 
