@@ -18,6 +18,7 @@
  * Copyright (C) 2010 Karel Zak <kzak@redhat.com>
  */
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -31,9 +32,13 @@
 #include "nls.h"
 #include "strutils.h"
 #include "xalloc.h"
-#include "procutils.h"
+#include "procfs.h"
 #include "c.h"
 #include "closestream.h"
+
+#ifndef PF_NO_SETAFFINITY
+# define PF_NO_SETAFFINITY 0x04000000
+#endif
 
 struct taskset {
 	pid_t		pid;		/* task PID */
@@ -41,8 +46,8 @@ struct taskset {
 	size_t		setsize;
 	char		*buf;		/* buffer for conversion from mask to string */
 	size_t		buflen;
-	unsigned int	use_list:1,	/* use list rather than masks */
-			get_only:1;	/* print the mask, but not modify */
+	bool		use_list,	/* use list rather than masks */
+			get_only;	/* print the mask, but not modify */
 };
 
 static void __attribute__((__noreturn__)) usage(void)
@@ -62,7 +67,7 @@ static void __attribute__((__noreturn__)) usage(void)
 		" -p, --pid               operate on existing given pid\n"
 		" -c, --cpu-list          display and specify cpus in list format\n"
 		));
-	printf(USAGE_HELP_OPTIONS(25));
+	fprintf(out, USAGE_HELP_OPTIONS(25));
 
 	fputs(USAGE_SEPARATOR, out);
 	fprintf(out, _(
@@ -78,7 +83,7 @@ static void __attribute__((__noreturn__)) usage(void)
 		"    e.g. 0-31:2 is equivalent to mask 0x55555555\n"),
 		program_invocation_short_name);
 
-	printf(USAGE_MAN_TAIL("taskset(1)"));
+	fprintf(out, USAGE_MAN_TAIL("taskset(1)"));
 	exit(EXIT_SUCCESS);
 }
 
@@ -112,12 +117,13 @@ static void __attribute__((__noreturn__)) err_affinity(pid_t pid, int set)
 	err(EXIT_FAILURE, msg, pid ? pid : getpid());
 }
 
+
 static void do_taskset(struct taskset *ts, size_t setsize, cpu_set_t *set)
 {
 	/* read the current mask */
 	if (ts->pid) {
 		if (sched_getaffinity(ts->pid, ts->setsize, ts->set) < 0)
-			err_affinity(ts->pid, 1);
+			err_affinity(ts->pid, 0);
 		print_affinity(ts, FALSE);
 	}
 
@@ -125,8 +131,22 @@ static void do_taskset(struct taskset *ts, size_t setsize, cpu_set_t *set)
 		return;
 
 	/* set new mask */
-	if (sched_setaffinity(ts->pid, setsize, set) < 0)
+	if (sched_setaffinity(ts->pid, setsize, set) < 0) {
+		uintmax_t flags = 0;
+		struct path_cxt *pc;
+		int errsv = errno;
+
+		if (errno != EPERM
+		    && (pc = ul_new_procfs_path(ts->pid, NULL))
+		    && procfs_process_get_stat_nth(pc, 9, &flags) == 0
+		    && (flags & PF_NO_SETAFFINITY)) {
+			warnx(_("affinity cannot be set due to PF_NO_SETAFFINITY flag set"));
+			errno = EINVAL;
+		} else
+			errno = errsv;
+
 		err_affinity(ts->pid, 1);
+	}
 
 	/* re-read the current mask */
 	if (ts->pid) {
@@ -228,10 +248,13 @@ int main(int argc, char **argv)
 	}
 
 	if (all_tasks && pid) {
-		struct proc_tasks *tasks = proc_open_tasks(pid);
-		while (!proc_next_tid(tasks, &ts.pid))
+		DIR *sub = NULL;
+		struct path_cxt *pc = ul_new_procfs_path(pid, NULL);
+
+		while (pc && procfs_process_next_tid(pc, &sub, &ts.pid) == 0)
 			do_taskset(&ts, new_setsize, new_set);
-		proc_close_tasks(tasks);
+
+		ul_unref_path(pc);
 	} else {
 		ts.pid = pid;
 		do_taskset(&ts, new_setsize, new_set);

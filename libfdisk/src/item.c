@@ -40,6 +40,9 @@ struct fdisk_labelitem *fdisk_new_labelitem(void)
 {
 	struct fdisk_labelitem *li = calloc(1, sizeof(*li));
 
+	if (!li)
+		return NULL;
+
 	li->refcount = 1;
 	DBG(ITEM, ul_debugobj(li, "alloc"));
 	return li;
@@ -55,7 +58,7 @@ struct fdisk_labelitem *fdisk_new_labelitem(void)
 void fdisk_ref_labelitem(struct fdisk_labelitem *li)
 {
 	if (li) {
-		/* me sure we do not use refcouting for static items */
+		/* make sure we do not use refcounting for static items */
 		assert(li->refcount > 0);
 		li->refcount++;
 	}
@@ -99,7 +102,7 @@ void fdisk_unref_labelitem(struct fdisk_labelitem *li)
 	if (!li)
 		return;
 
-	/* me sure we do not use refcouting for static items */
+	/* make sure we do not use refcounting for static items */
 	assert(li->refcount > 0);
 
 	li->refcount--;
@@ -196,8 +199,12 @@ int fdisk_labelitem_is_number(struct fdisk_labelitem *li)
 }
 
 #ifdef TEST_PROGRAM
-static int test_listitems(struct fdisk_test *ts, int argc, char *argv[])
+static int test_listitems(struct fdisk_test *ts __attribute__((unused)),
+			  int argc, char *argv[])
 {
+	if (argc != 2)
+		return -1;
+
 	const char *disk = argv[1];
 	struct fdisk_context *cxt;
 	struct fdisk_labelitem *item;

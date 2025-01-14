@@ -19,7 +19,7 @@
 TS_TOPDIR="${0%/*}/../.."
 TS_DESC="nested BSD"
 
-. $TS_TOPDIR/functions.sh
+. "$TS_TOPDIR"/functions.sh
 ts_init "$*"
 
 ts_check_test_command "$TS_CMD_FDISK"
@@ -76,7 +76,7 @@ TS_EXPECTED+="_${BSD_LABELSECTOR}_${BSD_LABELOFFSET}${BSD_EXTRA}.${BYTE_ORDER}"
 
 function print_layout {
 	echo -ne "\n---layout----------\n" >> $TS_OUTPUT
-	$TS_CMD_FDISK -l ${TEST_IMAGE_NAME}  >> $TS_OUTPUT
+	$TS_CMD_FDISK -x ${TEST_IMAGE_NAME}  >> $TS_OUTPUT
 	echo -ne   "-------------------\n\n" >> $TS_OUTPUT
 }
 

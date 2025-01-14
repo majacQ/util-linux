@@ -102,8 +102,6 @@ main(int argc, char *argv[])
 	textdomain(PACKAGE);
 	close_stdout_atexit();
 
-	setlocale(LC_ALL, "");
-
 	if ((file = getenv("WORDLIST")) && !access(file, R_OK))
 		/* use the WORDLIST */;
 	else
@@ -368,8 +366,8 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" -t, --terminate <char>   define the string-termination character\n"), out);
 
 	fputs(USAGE_SEPARATOR, out);
-	printf(USAGE_HELP_OPTIONS(26));
-	printf(USAGE_MAN_TAIL("look(1)"));
+	fprintf(out, USAGE_HELP_OPTIONS(26));
+	fprintf(out, USAGE_MAN_TAIL("look(1)"));
 
 	exit(EXIT_SUCCESS);
 }

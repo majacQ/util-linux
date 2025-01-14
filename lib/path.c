@@ -1,4 +1,10 @@
 /*
+ * No copyright is claimed.  This code is in the public domain; do with
+ * it what you wish.
+ *
+ * Copyright (C) 2018 Karel Zak <kzak@redhat.com>
+ *
+ *
  * Simple functions to access files. Paths can be globally prefixed to read
  * data from an alternative source (e.g. a /proc dump for regression tests).
  *
@@ -7,11 +13,6 @@
  *
  * The ul_path_read_* API is possible to use without path_cxt handler. In this
  * case is not possible to use global prefix and printf-like formatting.
- *
- * No copyright is claimed.  This code is in the public domain; do with
- * it what you wish.
- *
- * Written by Karel Zak <kzak@redhat.com> [February 2018]
  */
 #include <stdarg.h>
 #include <string.h>
@@ -339,23 +340,27 @@ int ul_path_accessf(struct path_cxt *pc, int mode, const char *path, ...)
 	return !p ? -errno : ul_path_access(pc, mode, p);
 }
 
-int ul_path_stat(struct path_cxt *pc, struct stat *sb, const char *path)
+int ul_path_stat(struct path_cxt *pc, struct stat *sb, int flags, const char *path)
 {
 	int rc;
 
 	if (!pc) {
-		rc = stat(path, sb);
+		rc = path ? stat(path, sb) : -EINVAL;
 		DBG(CXT, ul_debug("stat '%s' [no context, rc=%d]", path, rc));
 	} else {
 		int dir = ul_path_get_dirfd(pc);
 		if (dir < 0)
 			return dir;
-		if (*path == '/')
-			path++;
+		if (path) {
+			if  (*path == '/')
+				path++;
+			rc = fstatat(dir, path, sb, flags);
 
-		rc = fstatat(dir, path, sb, 0);
+		} else
+			rc = fstat(dir, sb);	/* dir itself */
 
 		if (rc && errno == ENOENT
+		    && path
 		    && pc->redirect_on_enoent
 		    && pc->redirect_on_enoent(pc, path, &dir) == 0)
 			rc = fstatat(dir, path, sb, 0);
@@ -365,10 +370,31 @@ int ul_path_stat(struct path_cxt *pc, struct stat *sb, const char *path)
 	return rc;
 }
 
+int ul_path_vstatf(struct path_cxt *pc, struct stat *sb, int flags, const char *path, va_list ap)
+{
+	const char *p = ul_path_mkpath(pc, path, ap);
+
+	return !p ? -errno : ul_path_stat(pc, sb, flags, p);
+}
+
+int ul_path_statf(struct path_cxt *pc, struct stat *sb, int flags, const char *path, ...)
+{
+	va_list ap;
+	int rc;
+
+	va_start(ap, path);
+	rc = ul_path_vstatf(pc, sb, flags, path, ap);
+	va_end(ap);
+
+	return rc;
+}
+
 int ul_path_open(struct path_cxt *pc, int flags, const char *path)
 {
 	int fd;
 
+	if (!path)
+		return -EINVAL;
 	if (!pc) {
 		fd = open(path, flags);
 		DBG(CXT, ul_debug("opening '%s' [no context]", path));
@@ -476,7 +502,7 @@ FILE *ul_path_fopenf(struct path_cxt *pc, const char *mode, const char *path, ..
 }
 
 /*
- * Open directory @path in read-onl mode. If the path is NULL then duplicate FD
+ * Open directory @path in read-only mode. If the path is NULL then duplicate FD
  * to the directory addressed by @pc.
  */
 DIR *ul_path_opendir(struct path_cxt *pc, const char *path)
@@ -510,7 +536,7 @@ DIR *ul_path_opendir(struct path_cxt *pc, const char *path)
 
 
 /*
- * Open directory @path in read-onl mode. If the path is NULL then duplicate FD
+ * Open directory @path in read-only mode. If the path is NULL then duplicate FD
  * to the directory addressed by @pc.
  */
 DIR *ul_path_vopendirf(struct path_cxt *pc, const char *path, va_list ap)
@@ -521,7 +547,7 @@ DIR *ul_path_vopendirf(struct path_cxt *pc, const char *path, va_list ap)
 }
 
 /*
- * Open directory @path in read-onl mode. If the path is NULL then duplicate FD
+ * Open directory @path in read-only mode. If the path is NULL then duplicate FD
  * to the directory addressed by @pc.
  */
 DIR *ul_path_opendirf(struct path_cxt *pc, const char *path, ...)
@@ -542,22 +568,27 @@ DIR *ul_path_opendirf(struct path_cxt *pc, const char *path, ...)
 ssize_t ul_path_readlink(struct path_cxt *pc, char *buf, size_t bufsiz, const char *path)
 {
 	int dirfd;
+	ssize_t ssz;
 
 	if (!path) {
 		const char *p = get_absdir(pc);
 		if (!p)
 			return -errno;
-		return readlink(p, buf, bufsiz);
+		ssz = readlink(p, buf, bufsiz - 1);
+	} else {
+		dirfd = ul_path_get_dirfd(pc);
+		if (dirfd < 0)
+			return dirfd;
+
+		if (*path == '/')
+			path++;
+
+		ssz = readlinkat(dirfd, path, buf, bufsiz - 1);
 	}
 
-	dirfd = ul_path_get_dirfd(pc);
-	if (dirfd < 0)
-		return dirfd;
-
-	if (*path == '/')
-		path++;
-
-	return readlinkat(dirfd, path, buf, bufsiz);
+	if (ssz >= 0)
+		buf[ssz] = '\0';
+	return ssz;
 }
 
 /*
@@ -617,7 +648,7 @@ int ul_path_readf(struct path_cxt *pc, char *buf, size_t len, const char *path, 
  * Returns newly allocated buffer with data from file. Maximal size is BUFSIZ
  * (send patch if you need something bigger;-)
  *
- * Returns size of the string!
+ * Returns size of the string without \0, nothing is allocated if returns <= 0.
  */
 int ul_path_read_string(struct path_cxt *pc, char **str, const char *path)
 {
@@ -628,15 +659,11 @@ int ul_path_read_string(struct path_cxt *pc, char **str, const char *path)
 		return -EINVAL;
 
 	*str = NULL;
-	rc = ul_path_read(pc, buf, sizeof(buf) - 1, path);
+
+	rc = ul_path_read_buffer(pc, buf, sizeof(buf), path);
 	if (rc < 0)
 		return rc;
 
-	/* Remove tailing newline (usual in sysfs) */
-	if (rc > 0 && *(buf + rc - 1) == '\n')
-		--rc;
-
-	buf[rc] = '\0';
 	*str = strdup(buf);
 	if (!*str)
 		rc = -ENOMEM;
@@ -659,28 +686,40 @@ int ul_path_readf_string(struct path_cxt *pc, char **str, const char *path, ...)
 int ul_path_read_buffer(struct path_cxt *pc, char *buf, size_t bufsz, const char *path)
 {
 	int rc = ul_path_read(pc, buf, bufsz - 1, path);
-	if (rc < 0)
-		return rc;
 
-	/* Remove tailing newline (usual in sysfs) */
-	if (rc > 0 && *(buf + rc - 1) == '\n')
-		buf[--rc] = '\0';
-	else
-		buf[rc - 1] = '\0';
+	if (rc == 0)
+		buf[0] = '\0';
+
+	else if (rc > 0) {
+		/* Remove trailing newline (usual in sysfs) */
+		if (*(buf + rc - 1) == '\n')
+			buf[--rc] = '\0';
+		else
+			buf[rc] = '\0';
+	}
 
 	return rc;
 }
 
-int ul_path_readf_buffer(struct path_cxt *pc, char *buf, size_t bufsz, const char *path, ...)
+int ul_path_vreadf_buffer(struct path_cxt *pc, char *buf, size_t bufsz, const char *path, va_list ap)
 {
 	const char *p;
-	va_list ap;
 
-	va_start(ap, path);
 	p = ul_path_mkpath(pc, path, ap);
-	va_end(ap);
 
 	return !p ? -errno : ul_path_read_buffer(pc, buf, bufsz, p);
+}
+
+int ul_path_readf_buffer(struct path_cxt *pc, char *buf, size_t bufsz, const char *path, ...)
+{
+	va_list ap;
+	int rc;
+
+	va_start(ap, path);
+	rc = ul_path_vreadf_buffer(pc, buf, bufsz, path, ap);
+	va_end(ap);
+
+	return rc;
 }
 
 int ul_path_scanf(struct path_cxt *pc, const char *path, const char *fmt, ...)
@@ -799,7 +838,7 @@ int ul_path_readf_s32(struct path_cxt *pc, int *res, const char *path, ...)
 int ul_path_read_u32(struct path_cxt *pc, unsigned int *res, const char *path)
 {
 	int rc;
-	unsigned int x;
+	unsigned int x = 0;
 
 	rc = ul_path_scanf(pc, path, "%u", &x);
 	if (rc != 1)
@@ -823,7 +862,7 @@ int ul_path_readf_u32(struct path_cxt *pc, unsigned int *res, const char *path, 
 
 int ul_path_read_majmin(struct path_cxt *pc, dev_t *res, const char *path)
 {
-	int rc, maj, min;
+	int rc, maj = 0, min = 0;
 
 	rc = ul_path_scanf(pc, path, "%d:%d", &maj, &min);
 	if (rc != 2)
@@ -958,65 +997,70 @@ int ul_path_countf_dirents(struct path_cxt *pc, const char *path, ...)
 	return !p ? -errno : ul_path_count_dirents(pc, p);
 }
 
-/*
- * Like fopen() but, @path is always prefixed by @prefix. This function is
- * useful in case when ul_path_* API is overkill.
- */
-FILE *ul_prefix_fopen(const char *prefix, const char *path, const char *mode)
+/* first call (when @sub is NULL) opens the directory, last call closes the directory */
+int ul_path_next_dirent(struct path_cxt *pc, DIR **sub, const char *dirname, struct dirent **d)
 {
-	char buf[PATH_MAX];
+	if (!pc || !sub || !d)
+		return -EINVAL;
 
-	if (!path)
-		return NULL;
-	if (!prefix)
-		return fopen(path, mode);
-	if (*path == '/')
-		path++;
+	if (!*sub) {
+		*sub = ul_path_opendir(pc, dirname);
+		if (!*sub)
+			return -errno;
+	}
 
-	snprintf(buf, sizeof(buf), "%s/%s", prefix, path);
-	return fopen(buf, mode);
+	*d = xreaddir(*sub);
+	if (*d)
+		return 0;
+
+	closedir(*sub);
+	*sub = NULL;
+	return 1;
 }
 
 #ifdef HAVE_CPU_SET_T
 static int ul_path_cpuparse(struct path_cxt *pc, cpu_set_t **set, int maxcpus, int islist, const char *path, va_list ap)
 {
-	FILE *f;
 	size_t setsize, len = maxcpus * 7;
-	char buf[len];
+	char *buf;
 	int rc;
 
 	*set = NULL;
 
-	f = ul_path_vfopenf(pc, "r" UL_CLOEXECSTR, path, ap);
-	if (!f)
-		return -errno;
+	buf = malloc(len);
+	if (!buf)
+		return -ENOMEM;
 
-	rc = fgets(buf, len, f) == NULL ? -errno : 0;
-	fclose(f);
-
-	if (rc)
-		return rc;
-
-	len = strlen(buf);
-	if (buf[len - 1] == '\n')
-		buf[len - 1] = '\0';
+	rc = ul_path_vreadf_buffer(pc, buf, len, path, ap);
+	if (rc < 0)
+		goto out;
 
 	*set = cpuset_alloc(maxcpus, &setsize, NULL);
-	if (!*set)
-		return -ENOMEM;
+	if (!*set) {
+		rc = -EINVAL;
+		goto out;
+	}
 
 	if (islist) {
 		if (cpulist_parse(buf, *set, setsize, 0)) {
-			cpuset_free(*set);
-			return -EINVAL;
+			errno = EINVAL;
+			rc = -errno;
+			goto out;
 		}
 	} else {
 		if (cpumask_parse(buf, *set, setsize)) {
-			cpuset_free(*set);
-			return -EINVAL;
+			errno = EINVAL;
+			rc = -errno;
+			goto out;
 		}
 	}
-	return 0;
+	rc = 0;
+
+out:
+	if (rc)
+		cpuset_free(*set);
+	free(buf);
+	return rc;
 }
 
 int ul_path_readf_cpuset(struct path_cxt *pc, cpu_set_t **set, int maxcpus, const char *path, ...)
@@ -1099,7 +1143,7 @@ int main(int argc, char *argv[])
 
 	ul_path_init_debug();
 
-	pc = ul_new_path(dir);
+	pc = ul_new_path("%s", dir);
 	if (!pc)
 		err(EXIT_FAILURE, "failed to initialize path context");
 	if (prefix)
@@ -1191,11 +1235,11 @@ int main(int argc, char *argv[])
 			errx(EXIT_FAILURE, "<file> not defined");
 		file = argv[optind++];
 
-		if (ul_path_read_string(pc, &res, file) < 0)
+		if (ul_path_read_string(pc, &res, file) <= 0)
 			err(EXIT_FAILURE, "read string failed");
 		printf("read:  %s: %s\n", file, res);
 
-		if (ul_path_readf_string(pc, &res, "%s", file) < 0)
+		if (ul_path_readf_string(pc, &res, "%s", file) <= 0)
 			err(EXIT_FAILURE, "readf string failed");
 		printf("readf: %s: %s\n", file, res);
 

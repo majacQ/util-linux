@@ -10,6 +10,13 @@ test -f sys-utils/mount.c || {
 	exit 1
 }
 
+unset CC
+unset CXX
+unset CFLAGS
+unset LDFLAGS
+unset SUID_CFLAGS
+unset SUID_LDFLAGS
+
 . tools/config-gen-functions.sh
 
 if [ $# -eq 0 ]; then
@@ -35,15 +42,23 @@ echo "Configure options:"
 for x in $opts; do
 	echo "	$x"
 done
+echo
+
 if [ -n "$CFLAGS" ]; then
-	echo "CFLAGS:	$CFLAGS"
+	echo "CFLAGS:   $CFLAGS"
 	CFLAGS="$CFLAGS"
 	export CFLAGS
+	echo
+fi
+if [ -n "$LDFLAGS" ]; then
+	echo "LDFLAGS:  $LDFLAGS"
+	LDFLAGS="$LDFLAGS"
+	export LDFLAGS
+	echo
 fi
 
 if [ ! -f ./configure ]; then
 	./autogen.sh
 fi
 
-echo
 ./configure $opts

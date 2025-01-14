@@ -316,3 +316,15 @@ FDISK_2.36 {
 	fdisk_label_advparse_parttype;
 	fdisk_label_get_parttype_shortcut;
 } FDISK_2.35;
+
+FDISK_2.38 {
+	fdisk_dos_fix_chs;
+} FDISK_2.36;
+
+FDISK_2.40 {
+	fdisk_partition_get_max_size;
+} FDISK_2.38;
+
+FDISK_2_41 {
+	fdisk_ask_menu;
+} FDISK_2.40;

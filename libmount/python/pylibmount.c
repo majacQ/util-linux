@@ -55,7 +55,7 @@ void *UL_RaiseExc(int e)
 			PyErr_SetString(LibmountError, "Not found required entry in fstab");
 			break;
 		case MNT_ERR_NOFSTYPE:
-			PyErr_SetString(LibmountError, "Lailed to detect filesystem type");
+			PyErr_SetString(LibmountError, "Failed to detect filesystem type");
 			break;
 		case MNT_ERR_NOSOURCE:
 			PyErr_SetString(LibmountError, "Required mount source undefined");
@@ -195,8 +195,8 @@ static struct PyModuleDef moduledef = {
         NULL
 };
 #define INITERROR return NULL
-PyObject * PyInit_pylibmount(void);
-PyObject * PyInit_pylibmount(void)
+PyMODINIT_FUNC PyInit_pylibmount(void);
+PyMODINIT_FUNC PyInit_pylibmount(void)
 #else
 #define INITERROR return
 # ifndef PyMODINIT_FUNC
@@ -220,9 +220,12 @@ PyMODINIT_FUNC initpylibmount(void)
 	if (!(pylibmount_debug_mask & PYMNT_DEBUG_INIT)) {
 		char *str = getenv("PYLIBMOUNT_DEBUG");
 
+		errno = 0;
 		pylibmount_debug_mask = 0;
 		if (str)
 			pylibmount_debug_mask = strtoul(str, NULL, 0);
+		if (errno)
+			pylibmount_debug_mask = 0;
 
 		pylibmount_debug_mask |= PYMNT_DEBUG_INIT;
 	}
