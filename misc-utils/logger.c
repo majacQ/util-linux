@@ -63,6 +63,7 @@
 #include "xalloc.h"
 #include "strv.h"
 #include "list.h"
+#include "pwdutils.h"
 
 #define	SYSLOG_NAMES
 #include <syslog.h>
@@ -117,6 +118,7 @@ struct logger_ctl {
 	pid_t pid;			/* zero when unwanted */
 	char *hdr;			/* the syslog header (based on protocol) */
 	char const *tag;
+	char *login;
 	char *msgid;
 	char *unix_socket;		/* -u <path> or default to _PATH_DEVLOG */
 	char *server;
@@ -152,13 +154,24 @@ static inline int logger_gettimeofday(struct timeval *tv, struct timezone *tz)
 	char *str = getenv("LOGGER_TEST_TIMEOFDAY");
 	uintmax_t sec, usec;
 
-	if (str && sscanf(str, "%ju.%ju", &sec, &usec) == 2) {
+	if (str) {
+		if (sscanf(str, "%ju.%ju", &sec, &usec) != 2)
+			goto err;
+
 		tv->tv_sec = sec;
 		tv->tv_usec = usec;
-		return tv->tv_sec >= 0 && tv->tv_usec >= 0 ? 0 : -EINVAL;
+
+		if (tv->tv_sec >= 0 && tv->tv_usec >= 0)
+			return 0;
+		else
+			goto err;
 	}
 
 	return gettimeofday(tv, tz);
+
+err:
+	errno = EINVAL;
+	return -1;
 }
 
 static inline char *logger_xgethostname(void)
@@ -246,7 +259,7 @@ static int unix_socket(struct logger_ctl *ctl, const char *path, int *socket_typ
 		errx(EXIT_FAILURE, _("openlog %s: pathname too long"), path);
 
 	s_addr.sun_family = AF_UNIX;
-	strcpy(s_addr.sun_path, path);
+	xstrncpy(s_addr.sun_path, path, sizeof(s_addr.sun_path));
 
 	for (i = 2; i; i--) {
 		int st = -1;
@@ -341,7 +354,7 @@ static int journald_entry(struct logger_ctl *ctl, FILE *fp)
 	int n, lines = 0, vectors = 8, ret = 0, msgline = -1;
 	size_t dummy = 0;
 
-	iovec = xmalloc(vectors * sizeof(struct iovec));
+	iovec = xreallocarray(NULL, vectors, sizeof(struct iovec));
 	while (1) {
 		buf = NULL;
 		sz = getline(&buf, &dummy, fp);
@@ -373,7 +386,7 @@ static int journald_entry(struct logger_ctl *ctl, FILE *fp)
 			vectors *= 2;
 			if (IOV_MAX < vectors)
 				errx(EXIT_FAILURE, _("maximum input lines (%d) exceeded"), IOV_MAX);
-			iovec = xrealloc(iovec, vectors * sizeof(struct iovec));
+			iovec = xreallocarray(iovec, vectors, sizeof(struct iovec));
 		}
 		iovec[lines].iov_base = buf;
 		iovec[lines].iov_len = sz;
@@ -393,16 +406,6 @@ static int journald_entry(struct logger_ctl *ctl, FILE *fp)
 }
 #endif
 
-static char const *xgetlogin(void)
-{
-	char const *cp;
-	struct passwd *pw;
-
-	if (!(cp = getlogin()) || !*cp)
-		cp = (pw = getpwuid(geteuid()))? pw->pw_name : "<someone>";
-	return cp;
-}
-
 /* this creates a timestamp based on current time according to the
  * fine rules of RFC3164, most importantly it ensures in a portable
  * way that the month day is correctly written (with a SP instead
@@ -414,12 +417,15 @@ static char const *rfc3164_current_time(void)
 	static char time[32];
 	struct timeval tv;
 	struct tm tm;
+	int ret;
 	static char const * const monthnames[] = {
 		"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug",
 		"Sep", "Oct", "Nov", "Dec"
 	};
 
-	logger_gettimeofday(&tv, NULL);
+	ret = logger_gettimeofday(&tv, NULL);
+	if (ret == -1)
+		err(EXIT_FAILURE, _("gettimeofday() failed"));
 	localtime_r(&tv.tv_sec, &tm);
 	snprintf(time, sizeof(time),"%s %2d %2.2d:%2.2d:%2.2d",
 		monthnames[tm.tm_mon], tm.tm_mday,
@@ -459,7 +465,7 @@ static void write_output(struct logger_ctl *ctl, const char *const msg)
 	if (!ctl->noact && !is_connected(ctl))
 		logger_reopen(ctl);
 
-	/* 1) octen count */
+	/* 1) octet count */
 	if (ctl->octet_count) {
 		size_t len = xasprintf(&octet, "%zu ", strlen(ctl->hdr) + strlen(msg));
 		iovec_add_string(iov, iovlen, octet, len);
@@ -479,7 +485,7 @@ static void write_output(struct logger_ctl *ctl, const char *const msg)
 		union {
 			struct cmsghdr cmh;
 			char   control[CMSG_SPACE(sizeof(struct ucred))];
-		} cbuf;
+		} cbuf = { .control = { 0 } };
 #endif
 
 		/* 4) add extra \n to make sure message is terminated */
@@ -619,7 +625,8 @@ static void add_structured_data_param(struct list_head *ls, const char *param)
 		err_oom();
 }
 
-static void add_structured_data_paramf(struct list_head *ls, const char *fmt, ...)
+static void __attribute__ ((__format__ (__printf__, 2, 3)))
+	add_structured_data_paramf(struct list_head *ls, const char *fmt, ...)
 {
 	struct structured_data *sd;
 	va_list ap;
@@ -662,7 +669,7 @@ static char *strdup_structured_data_list(struct list_head *ls)
 
 		if (!one)
 			continue;
-		res = strappend(tmp, one);
+		res = strconcat(tmp, one);
 		free(tmp);
 		free(one);
 	}
@@ -680,7 +687,7 @@ static char *get_structured_data_string(struct logger_ctl *ctl)
 		usr = strdup_structured_data_list(&ctl->user_sds);
 
 	if (sys && usr) {
-		res = strappend(sys, usr);
+		res = strconcat(sys, usr);
 		free(sys);
 		free(usr);
 	} else
@@ -691,12 +698,36 @@ static char *get_structured_data_string(struct logger_ctl *ctl)
 
 static int valid_structured_data_param(const char *str)
 {
+	char *s;
 	char *eq  = strchr(str, '='),
 	     *qm1 = strchr(str, '"'),
-	     *qm2 = qm1 ? strchr(qm1 + 1, '"') : NULL;
+	     *qm2 = qm1 ? ul_strchr_escaped(qm1 + 1, '"') : NULL;
 
-	if (!eq || !qm1 || !qm2)		/* something is missing */
+	/* something is missing */
+	if (!eq || !qm1 || !qm2)
 		return 0;
+
+	/* ']' need to be escaped */
+	for (s = qm1 + 1; s && *s; ) {
+		char *p = strchr(s, ']');
+		if (!p)
+			break;
+		if (p > qm2 || p == ul_strchr_escaped(s, ']'))
+			return 0;
+		s = p + 1;
+	}
+
+	/* '\' is allowed only before '[]"\' chars */
+	for (s = qm1 + 1; s && *s; ) {
+		char *p = strchr(s, '\\');
+		if (!p)
+			break;
+		if (!strchr("[]\"\\", *(p + 1)))
+			return 0;
+		s = p + 1;
+		if (*s == '\\')
+			s++;
+	}
 
 	/* foo="bar" */
 	return eq > str && eq < qm1 && eq + 1 == qm1 && qm1 < qm2 && *(qm2 + 1) == '\0';
@@ -765,6 +796,7 @@ static int valid_structured_data_id(const char *str)
  */
 static void syslog_rfc5424_header(struct logger_ctl *const ctl)
 {
+	int ret;
 	char *time;
 	char *hostname;
 	char const *app_name = ctl->tag;
@@ -777,16 +809,18 @@ static void syslog_rfc5424_header(struct logger_ctl *const ctl)
 		struct timeval tv;
 		struct tm tm;
 
-		logger_gettimeofday(&tv, NULL);
+		ret = logger_gettimeofday(&tv, NULL);
+		if (ret == -1)
+			err(EXIT_FAILURE, _("gettimeofday() failed"));
 		if (localtime_r(&tv.tv_sec, &tm) != NULL) {
 			char fmt[64];
 			const size_t i = strftime(fmt, sizeof(fmt),
-						  "%Y-%m-%dT%H:%M:%S.%%06u%z ", &tm);
+						  "%Y-%m-%dT%H:%M:%S.%%06jd%z ", &tm);
 			/* patch TZ info to comply with RFC3339 (we left SP at end) */
 			fmt[i - 1] = fmt[i - 2];
 			fmt[i - 2] = fmt[i - 3];
 			fmt[i - 3] = ':';
-			xasprintf(&time, fmt, tv.tv_usec);
+			xasprintf(&time, fmt, (intmax_t) tv.tv_usec);
 		} else
 			err(EXIT_FAILURE, _("localtime() failed"));
 	} else
@@ -925,9 +959,9 @@ static void logger_open(struct logger_ctl *ctl)
 		ctl->syslogfp = ctl->server ? syslog_rfc5424_header :
 					      syslog_local_header;
 	if (!ctl->tag)
-		ctl->tag = xgetlogin();
-
-	generate_syslog_header(ctl);
+		ctl->tag = ctl->login = xgetlogin();
+	if (!ctl->tag)
+		ctl->tag = "<someone>";
 }
 
 /* re-open; usually after failed connection */
@@ -977,13 +1011,9 @@ static void logger_stdin(struct logger_ctl *ctl)
 {
 	/* note: we re-generate the syslog header for each log message to
 	 * update header timestamps and to reflect possible priority changes.
-	 * The initial header is generated by logger_open().
 	 */
-	int has_header = 1;
 	int default_priority = ctl->pri;
-	int last_pri = default_priority;
-	size_t max_usrmsg_size = ctl->max_message_size - strlen(ctl->hdr);
-	char *const buf = xmalloc(max_usrmsg_size + 2 + 2);
+	char *buf = xmalloc(ctl->max_message_size + 2 + 2);
 	int pri;
 	int c;
 	size_t i;
@@ -1003,33 +1033,25 @@ static void logger_stdin(struct logger_ctl *ctl)
 			if (c == '>' && 0 <= pri && pri <= 191) {
 				/* valid RFC PRI values */
 				i = 0;
-				if (pri < 8)	/* kern facility is forbidden */
-					pri |= 8;
+				if ((pri & LOG_FACMASK) == 0)
+					pri |= (default_priority & LOG_FACMASK);
 				ctl->pri = pri;
 			} else
 				ctl->pri = default_priority;
 
-			if (ctl->pri != last_pri) {
-				has_header = 0;
-				max_usrmsg_size =
-				    ctl->max_message_size - strlen(ctl->hdr);
-				last_pri = ctl->pri;
-			}
 			if (c != EOF && c != '\n')
 				c = getchar();
 		}
 
-		while (c != EOF && c != '\n' && i < max_usrmsg_size) {
+		while (c != EOF && c != '\n' && i < ctl->max_message_size) {
 			buf[i++] = c;
 			c = getchar();
 		}
 		buf[i] = '\0';
 
 		if (i > 0 || !ctl->skip_empty_lines) {
-			if (!has_header)
-				generate_syslog_header(ctl);
+			generate_syslog_header(ctl);
 			write_output(ctl, buf);
-			has_header = 0;
 		}
 
 		if (c == '\n')	/* discard line terminator */
@@ -1044,6 +1066,7 @@ static void logger_close(const struct logger_ctl *ctl)
 	if (ctl->fd != -1 && close(ctl->fd) != 0)
 		err(EXIT_FAILURE, _("close failed"));
 	free(ctl->hdr);
+	free(ctl->login);
 }
 
 static void __attribute__((__noreturn__)) usage(void)
@@ -1078,15 +1101,15 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_("     --sd-param <data>    rfc5424 structured data name=value\n"), out);
 	fputs(_("     --msgid <msgid>      set rfc5424 message id field\n"), out);
 	fputs(_(" -u, --socket <socket>    write to this Unix socket\n"), out);
-	fputs(_("     --socket-errors[=<on|off|auto>]\n"
+	fputs(_("     --socket-errors on|off|auto\n"
 		"                          print connection errors when using Unix sockets\n"), out);
 #ifdef HAVE_LIBSYSTEMD
 	fputs(_("     --journald[=<file>]  write journald entry\n"), out);
 #endif
 
 	fputs(USAGE_SEPARATOR, out);
-	printf(USAGE_HELP_OPTIONS(26));
-	printf(USAGE_MAN_TAIL("logger(1)"));
+	fprintf(out, USAGE_HELP_OPTIONS(26));
+	fprintf(out, USAGE_MAN_TAIL("logger(1)"));
 
 	exit(EXIT_SUCCESS);
 }
@@ -1305,12 +1328,14 @@ int main(int argc, char **argv)
 		abort();
 	}
 	logger_open(&ctl);
-	if (0 < argc)
+	if (0 < argc) {
+		generate_syslog_header(&ctl);
 		logger_command_line(&ctl, argv);
-	else
+	} else
 		/* Note. --file <arg> reopens stdin making the below
 		 * function to be used for file inputs. */
 		logger_stdin(&ctl);
+
 	logger_close(&ctl);
 	return EXIT_SUCCESS;
 }

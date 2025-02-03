@@ -1,15 +1,18 @@
 dir_libfdisk = include_directories('.', 'src')
 
 defs = configuration_data()
-defs.set('LIBFDISK_VERSION', libfdisk_version)
-defs.set('LIBFDISK_MAJOR_VERSION', libfdisk_version.split('.')[0])
-defs.set('LIBFDISK_MINOR_VERSION', libfdisk_version.split('.')[1])
-defs.set('LIBFDISK_PATCH_VERSION', libfdisk_version.split('.')[2])
+defs.set('LIBFDISK_VERSION', pc_version)
+defs.set('LIBFDISK_MAJOR_VERSION', pc_version.split('.')[0])
+defs.set('LIBFDISK_MINOR_VERSION', pc_version.split('.')[1])
+defs.set('LIBFDISK_PATCH_VERSION', pc_version.split('.')[2])
 
-libfdisk_h = configure_file(
+configure_file(
   input : 'src/libfdisk.h.in',
   output : 'libfdisk.h',
-  configuration : defs)
+  configuration : defs,
+  install : build_libfdisk,
+  install_dir : get_option('includedir') / 'libfdisk',
+)
 
 lib_fdisk_sources = '''
   src/fdiskP.h
@@ -54,11 +57,11 @@ lib__fdisk = static_library(
   dependencies : build_libfdisk ? [] : disabler())
 
 lib_fdisk_static = static_library(
-  'fdisk',
+  'fdisk_static',
   link_whole : lib__fdisk,
   link_with : [lib_common,
-               lib_blkid.get_static_lib(),
                lib_uuid.get_static_lib()],
+  dependencies : [blkid_static_dep],
   install : false)
 
 lib_fdisk = library(
@@ -68,11 +71,17 @@ lib_fdisk = library(
   version : libfdisk_version,
   link_args : ['-Wl,--version-script=@0@'.format(libfdisk_sym_path)],
   link_with : [lib_common,
-               lib_blkid,
                lib_uuid],
+  dependencies : [blkid_dep],
   install : build_libfdisk)
+fdisk_dep = declare_dependency(link_with: lib_fdisk, include_directories: '.')
 
-pkgconfig.generate(lib_fdisk,
-                   description : 'fdisk library',
-                   subdirs : 'libfdisk',
-                   version : pc_version)
+if build_libfdisk
+  pkgconfig.generate(lib_fdisk,
+                     description : 'fdisk library',
+                     subdirs : 'libfdisk',
+                     version : pc_version)
+  if meson.version().version_compare('>=0.54.0')
+    meson.override_dependency('fdisk', fdisk_dep)
+  endif
+endif

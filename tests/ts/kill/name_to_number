@@ -20,11 +20,14 @@ ts_init "$*"
 
 # make sure we do not use shell built-in command
 if [ "$TS_USE_SYSTEM_COMMANDS" == "yes" ]; then
-	TS_CMD_KILL="/bin/kill"
+	TS_CMD_KILL="$(which kill)"
 fi
 
 ts_check_test_command "$TS_CMD_KILL"
 ts_check_test_command "$TS_HELPER_SIGRECEIVE"
+
+# SIGRTMAX-0 and SIGRTMAX-1 are not usable under QEMU
+ts_skip_qemu_user
 
 . "$TS_SELF/kill_functions.sh"
 

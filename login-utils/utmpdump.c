@@ -74,8 +74,16 @@ static time_t strtotime(const char *s_time)
 static suseconds_t strtousec(const char *s_time)
 {
 	const char *s = strchr(s_time, ',');
-	if (s)
-		return (suseconds_t) atoi(s + 1);
+
+	if (s && *++s) {
+		suseconds_t us;
+		char *end = NULL;
+
+		errno = 0;
+		us = strtol(s, &end, 10);
+		if (errno == 0 && end && end > s)
+			return us;
+	}
 	return 0;
 }
 
@@ -100,7 +108,7 @@ static void print_utline(struct utmpx *ut, FILE *out)
 		addr_string = inet_ntop(AF_INET, &(ut->ut_addr_v6), buffer, sizeof(buffer));
 
 	tv.tv_sec = ut->ut_tv.tv_sec;
-	tv.tv_usec = ut->ut_tv.tv_usec;
+	tv.tv_usec = ut->ut_tv.tv_usec < (int32_t) USEC_PER_SEC ? ut->ut_tv.tv_usec : 0;
 
 	if (strtimeval_iso(&tv, ISO_TIMESTAMP_COMMA_GT, time_string,
 			   sizeof(time_string)) != 0)
@@ -266,7 +274,7 @@ static int gettok(char *line, char *dest, int size, int eatspace)
 static void undump(FILE *in, FILE *out)
 {
 	struct utmpx ut;
-	char s_addr[INET6_ADDRSTRLEN + 1], s_time[29], *linestart, *line;
+	char s_addr[INET6_ADDRSTRLEN + 1], s_time[29] = {}, *linestart, *line;
 
 	linestart = xmalloc(1024 * sizeof(*linestart));
 	s_time[28] = 0;
@@ -274,7 +282,12 @@ static void undump(FILE *in, FILE *out)
 	while (fgets(linestart, 1023, in)) {
 		line = linestart;
 		memset(&ut, '\0', sizeof(ut));
-		sscanf(line, "[%hd] [%d] [%4c] ", &ut.ut_type, &ut.ut_pid, ut.ut_id);
+
+		if (sscanf(line, "[%hd] [%d] [%4c] ",
+				&ut.ut_type, &ut.ut_pid, ut.ut_id) != 3) {
+			warnx(_("parse error: %s"), line);
+			continue;
+		}
 
 		line += 19;
 		line += gettok(line, ut.ut_user, sizeof(ut.ut_user), 1);
@@ -311,9 +324,9 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" -f, --follow         output appended data as the file grows\n"), out);
 	fputs(_(" -r, --reverse        write back dumped data into utmp file\n"), out);
 	fputs(_(" -o, --output <file>  write to file instead of standard output\n"), out);
-	printf(USAGE_HELP_OPTIONS(22));
+	fprintf(out, USAGE_HELP_OPTIONS(22));
 
-	printf(USAGE_MAN_TAIL("utmpdump(1)"));
+	fprintf(out, USAGE_MAN_TAIL("utmpdump(1)"));
 	exit(EXIT_SUCCESS);
 }
 

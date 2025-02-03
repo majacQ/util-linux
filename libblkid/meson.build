@@ -1,9 +1,21 @@
 dir_libblkid = include_directories('.', 'src')
+if not build_libblkid
+  blkid_dep = disabler()
+  blkid_static_dep = disabler()
+  subdir_done()
+endif
 
-blkid_h = configure_file(
+defs = configuration_data()
+defs.set('LIBBLKID_DATE', libblkid_date)
+defs.set('LIBBLKID_VERSION', pc_version)
+
+configure_file(
   input : 'src/blkid.h.in',
   output : 'blkid.h',
-  configuration : conf)
+  configuration : defs,
+  install : build_libblkid,
+  install_dir : get_option('includedir') / 'blkid',
+)
 
 lib_blkid_sources = '''
   src/blkidP.h
@@ -48,6 +60,7 @@ lib_blkid_sources = '''
   src/superblocks/bitlocker.c
   src/superblocks/bluestore.c
   src/superblocks/btrfs.c
+  src/superblocks/cs_fvault2.c
   src/superblocks/cramfs.c
   src/superblocks/ddf_raid.c
   src/superblocks/drbd.c
@@ -123,21 +136,34 @@ if build_libblkid and not have_dirfd and not have_ddfd
   error('neither dirfd nor ddfd are available')
 endif
 
+libblkid_link_depends = []
+libblkid_link_args = []
+
+if cc.has_link_argument('-Wl,--version-script=@0@'.format(libblkid_sym_path))
+	libblkid_link_depends += [libblkid_sym]
+	libblkid_link_args += ['-Wl,--version-script=@0@'.format(libblkid_sym_path)]
+endif
+
 lib_blkid = both_libraries(
   'blkid',
   list_h,
   lib_blkid_sources,
   include_directories : [dir_include, dir_libblkid],
-  link_depends : libblkid_sym,
+  link_depends : libblkid_link_depends,
   version : libblkid_version,
-  link_args : ['-Wl,--version-script=@0@'.format(libblkid_sym_path)],
+  link_args : libblkid_link_args,
   link_with : lib_common,
-  dependencies : build_libblkid ? [] : disabler(),
+  dependencies : build_libblkid ? [lib_econf] : disabler(),
   install : build_libblkid)
+blkid_dep = declare_dependency(link_with: lib_blkid, include_directories: '.')
 
 lib_blkid_static = lib_blkid.get_static_lib()
+blkid_static_dep = declare_dependency(link_with: lib_blkid_static, include_directories: '.')
 
 pkgconfig.generate(lib_blkid,
-                   description : 'Block device id library',
-                   subdirs : 'blkid',
-                   version : pc_version)
+                    description : 'Block device id library',
+                    subdirs : 'blkid',
+                    version : pc_version)
+if meson.version().version_compare('>=0.54.0')
+  meson.override_dependency('blkid', blkid_dep)
+endif

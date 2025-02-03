@@ -101,12 +101,12 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" -v, --verbose        verbose mode\n"), out);
 
 	fputs(USAGE_SEPARATOR, out);
-	printf(USAGE_HELP_OPTIONS(22));
+	fprintf(out, USAGE_HELP_OPTIONS(22));
 
 	fputs(USAGE_ARGUMENTS, out);
-	printf(USAGE_ARG_SIZE(_("<num>")));
+	fprintf(out, USAGE_ARG_SIZE(_("<num>")));
 
-	printf(USAGE_MAN_TAIL("fallocate(1)"));
+	fprintf(out, USAGE_MAN_TAIL("fallocate(1)"));
 
 	exit(EXIT_SUCCESS);
 }
@@ -144,8 +144,8 @@ static void xfallocate(int fd, int mode, off_t offset, off_t length)
 #ifdef HAVE_POSIX_FALLOCATE
 static void xposix_fallocate(int fd, off_t offset, off_t length)
 {
-	int error = posix_fallocate(fd, offset, length);
-	if (error < 0) {
+	errno = posix_fallocate(fd, offset, length);
+	if (errno != 0) {
 		err(EXIT_FAILURE, _("fallocate failed"));
 	}
 }
@@ -290,7 +290,9 @@ int main(int argc, char **argv)
 	int	fd;
 	int	mode = 0;
 	int	dig = 0;
-	int posix = 0;
+#ifdef HAVE_POSIX_FALLOCATE
+	int	posix = 0;
+#endif
 	loff_t	length = -2LL;
 	loff_t	offset = 0;
 
@@ -313,7 +315,7 @@ int main(int argc, char **argv)
 	static const ul_excl_t excl[] = {	/* rows and cols in ASCII order */
 		{ 'c', 'd', 'p', 'z' },
 		{ 'c', 'n' },
-		{ 'x', 'c', 'd', 'i', 'n', 'p', 'z'},
+		{ 'c', 'd', 'i', 'n', 'p', 'x', 'z'},
 		{ 0 }
 	};
 	int excl_st[ARRAY_SIZE(excl)] = UL_EXCL_STATUS_INIT;
@@ -406,12 +408,35 @@ int main(int argc, char **argv)
 
 	if (dig)
 		dig_holes(fd, offset, length);
+	else {
 #ifdef HAVE_POSIX_FALLOCATE
-	else if (posix)
-		xposix_fallocate(fd, offset, length);
+		if (posix)
+			xposix_fallocate(fd, offset, length);
+		else
 #endif
-	else
-		xfallocate(fd, mode, offset, length);
+			xfallocate(fd, mode, offset, length);
+
+		if (verbose) {
+			char *str = size_to_human_string(SIZE_SUFFIX_3LETTER | SIZE_SUFFIX_SPACE, length);
+
+			if (mode & FALLOC_FL_PUNCH_HOLE)
+				fprintf(stdout, _("%s: %s (%ju bytes) hole created.\n"),
+								filename, str, length);
+			else if (mode & FALLOC_FL_COLLAPSE_RANGE)
+				fprintf(stdout, _("%s: %s (%ju bytes) removed.\n"),
+								filename, str, length);
+			else if (mode & FALLOC_FL_INSERT_RANGE)
+				fprintf(stdout, _("%s: %s (%ju bytes) inserted.\n"),
+								filename, str, length);
+			else if (mode & FALLOC_FL_ZERO_RANGE)
+				fprintf(stdout, _("%s: %s (%ju bytes) zeroed.\n"),
+								filename, str, length);
+			else
+				fprintf(stdout, _("%s: %s (%ju bytes) allocated.\n"),
+								filename, str, length);
+			free(str);
+		}
+	}
 
 	if (close_fd(fd) != 0)
 		err(EXIT_FAILURE, _("write failed: %s"), filename);

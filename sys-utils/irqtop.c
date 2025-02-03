@@ -1,22 +1,16 @@
 /*
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
  * irqtop.c - utility to display kernel interrupt information.
  *
  * Copyright (C) 2019 zhenwei pi <pizhenwei@bytedance.com>
  * Copyright (C) 2020 Karel Zak <kzak@redhat.com>
+ * Copyright (C) 2024 Robin Jarry <robin@jarry.cc>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
  * version 2.1 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
  */
 #include <ctype.h>
 #include <errno.h>
@@ -57,6 +51,7 @@
 #include <libsmartcols.h>
 
 #include "closestream.h"
+#include "cpuset.h"
 #include "monotonic.h"
 #include "pathnames.h"
 #include "strutils.h"
@@ -68,18 +63,28 @@
 
 #define MAX_EVENTS	3
 
+enum irqtop_cpustat_mode {
+	IRQTOP_CPUSTAT_AUTO,
+	IRQTOP_CPUSTAT_ENABLE,
+	IRQTOP_CPUSTAT_DISABLE,
+};
+
 /* top control struct */
 struct irqtop_ctl {
-	WINDOW		*win;
-	int		cols;
-	int		rows;
-	char		*hostname;
+	WINDOW	*win;
+	int	cols;
+	int	rows;
+	char	*hostname;
 
 	struct itimerspec timer;
 	struct irq_stat	*prev_stat;
+	uintmax_t threshold;
+	size_t setsize;
+	cpu_set_t *cpuset;
 
-	unsigned int request_exit:1;
-	unsigned int softirq:1;
+	enum irqtop_cpustat_mode cpustat_mode;
+	bool	request_exit,
+		softirq;
 };
 
 /* user's input parser */
@@ -98,13 +103,14 @@ static void parse_input(struct irqtop_ctl *ctl, struct irq_output *out, char c)
 
 static int update_screen(struct irqtop_ctl *ctl, struct irq_output *out)
 {
-	struct libscols_table *table, *cpus;
+	struct libscols_table *table, *cpus = NULL;
 	struct irq_stat *stat;
 	time_t now = time(NULL);
 	char timestr[64], *data, *data0, *p;
 
 	/* make irqs table */
-	table = get_scols_table(out, ctl->prev_stat, &stat, ctl->softirq);
+	table = get_scols_table(out, ctl->prev_stat, &stat, ctl->softirq,
+				ctl->threshold, ctl->setsize, ctl->cpuset);
 	if (!table) {
 		ctl->request_exit = 1;
 		return 1;
@@ -114,8 +120,13 @@ static int update_screen(struct irqtop_ctl *ctl, struct irq_output *out)
 	scols_table_reduce_termwidth(table, 1);
 
 	/* make cpus table */
-	cpus = get_scols_cpus_table(out, ctl->prev_stat, stat);
-	scols_table_reduce_termwidth(cpus, 1);
+	if (ctl->cpustat_mode != IRQTOP_CPUSTAT_DISABLE) {
+		cpus = get_scols_cpus_table(out, ctl->prev_stat, stat, ctl->setsize,
+					    ctl->cpuset);
+		scols_table_reduce_termwidth(cpus, 1);
+		if (ctl->cpustat_mode == IRQTOP_CPUSTAT_AUTO)
+			scols_table_enable_nowrap(cpus, 1);
+	}
 
 	/* print header */
 	move(0, 0);
@@ -123,10 +134,12 @@ static int update_screen(struct irqtop_ctl *ctl, struct irq_output *out)
 	wprintw(ctl->win, _("irqtop | total: %ld delta: %ld | %s | %s\n\n"),
 			   stat->total_irq, stat->delta_irq, ctl->hostname, timestr);
 
-	/* print cpus table */
-	scols_print_table_to_string(cpus, &data);
-	wprintw(ctl->win, "%s\n\n", data);
-	free(data);
+	/* print cpus table or not by -c option */
+	if (cpus) {
+		scols_print_table_to_string(cpus, &data);
+		wprintw(ctl->win, "%s\n\n", data);
+		free(data);
+	}
 
 	/* print irqs table */
 	scols_print_table_to_string(table, &data0);
@@ -166,7 +179,7 @@ static int event_loop(struct irqtop_ctl *ctl, struct irq_output *out)
 	efd = epoll_create1(0);
 
 	if ((tfd = timerfd_create(CLOCK_MONOTONIC, 0)) < 0)
-		err(EXIT_FAILURE, _("cannot not create timerfd"));
+		err(EXIT_FAILURE, _("cannot create timerfd"));
 	if (timerfd_settime(tfd, 0, &ctl->timer, NULL) != 0)
 		err(EXIT_FAILURE, _("cannot set timerfd"));
 
@@ -186,7 +199,7 @@ static int event_loop(struct irqtop_ctl *ctl, struct irq_output *out)
 	sigaddset(&sigmask, SIGQUIT);
 
 	if ((sfd = signalfd(-1, &sigmask, SFD_CLOEXEC)) < 0)
-		err(EXIT_FAILURE, _("cannot not create signalfd"));
+		err(EXIT_FAILURE, _("cannot create signalfd"));
 
 	ev.events = EPOLLIN;
 	ev.data.fd = sfd;
@@ -247,12 +260,15 @@ static void __attribute__((__noreturn__)) usage(void)
 	puts(_("Interactive utility to display kernel interrupt information."));
 
 	fputs(USAGE_OPTIONS, stdout);
+	fputs(_(" -c, --cpu-stat <mode> show per-cpu stat (auto, enable, disable)\n"), stdout);
+	fputs(_(" -C, --cpu-list <list> specify cpus in list format\n"), stdout);
 	fputs(_(" -d, --delay <secs>   delay updates\n"), stdout);
 	fputs(_(" -o, --output <list>  define which output columns to use\n"), stdout);
 	fputs(_(" -s, --sort <column>  specify sort column\n"), stdout);
 	fputs(_(" -S, --softirq        show softirqs instead of interrupts\n"), stdout);
+	fputs(_(" -t, --threshold <N>  only IRQs with counters above <N>\n"), stdout);
 	fputs(USAGE_SEPARATOR, stdout);
-	printf(USAGE_HELP_OPTIONS(22));
+	fprintf(stdout, USAGE_HELP_OPTIONS(22));
 
 	fputs(_("\nThe following interactive key commands are valid:\n"), stdout);
 	fputs(_("  i      sort by IRQ\n"), stdout);
@@ -264,7 +280,7 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(USAGE_COLUMNS, stdout);
 	irq_print_columns(stdout, 0);
 
-	printf(USAGE_MAN_TAIL("irqtop(1)"));
+	fprintf(stdout, USAGE_MAN_TAIL("irqtop(1)"));
 	exit(EXIT_SUCCESS);
 }
 
@@ -275,18 +291,46 @@ static void parse_args(	struct irqtop_ctl *ctl,
 {
 	const char *outarg = NULL;
 	static const struct option longopts[] = {
+		{"cpu-stat", required_argument, NULL, 'c'},
+		{"cpu-list", required_argument, NULL, 'C'},
 		{"delay", required_argument, NULL, 'd'},
 		{"sort", required_argument, NULL, 's'},
 		{"output", required_argument, NULL, 'o'},
 		{"softirq", no_argument, NULL, 'S'},
+		{"threshold", required_argument, NULL, 't'},
 		{"help", no_argument, NULL, 'h'},
 		{"version", no_argument, NULL, 'V'},
 		{NULL, 0, NULL, 0}
 	};
 	int o;
 
-	while ((o = getopt_long(argc, argv, "d:o:s:ShV", longopts, NULL)) != -1) {
+	while ((o = getopt_long(argc, argv, "c:C:d:o:s:St:hV", longopts, NULL)) != -1) {
 		switch (o) {
+		case 'c':
+			if (!strcmp(optarg, "auto"))
+				ctl->cpustat_mode = IRQTOP_CPUSTAT_AUTO;
+			else if (!strcmp(optarg, "enable"))
+				ctl->cpustat_mode = IRQTOP_CPUSTAT_ENABLE;
+			else if (!strcmp(optarg, "disable"))
+				ctl->cpustat_mode = IRQTOP_CPUSTAT_DISABLE;
+			else
+				errx(EXIT_FAILURE, _("unsupported mode '%s'"), optarg);
+			break;
+		case 'C':
+			{
+				int ncpus = get_max_number_of_cpus();
+				if (ncpus <= 0)
+					errx(EXIT_FAILURE, _("cannot determine NR_CPUS; aborting"));
+
+				ctl->cpuset = cpuset_alloc(ncpus, &ctl->setsize, NULL);
+				if (!ctl->cpuset)
+					err(EXIT_FAILURE, _("cpuset_alloc failed"));
+
+				if (cpulist_parse(optarg, ctl->cpuset, ctl->setsize, 0))
+					errx(EXIT_FAILURE, _("failed to parse CPU list: %s"),
+						optarg);
+			}
+			break;
 		case 'd':
 			{
 				struct timeval delay;
@@ -305,6 +349,9 @@ static void parse_args(	struct irqtop_ctl *ctl,
 			break;
 		case 'S':
 			ctl->softirq = 1;
+			break;
+		case 't':
+			ctl->threshold = strtosize_or_err(optarg, _("error: --threshold"));
 			break;
 		case 'V':
 			print_version(EXIT_SUCCESS);
@@ -363,6 +410,7 @@ int main(int argc, char **argv)
 
 	free_irqstat(ctl.prev_stat);
 	free(ctl.hostname);
+	cpuset_free(ctl.cpuset);
 
 	if (is_tty)
 		tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved_tty);

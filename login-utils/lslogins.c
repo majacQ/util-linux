@@ -47,6 +47,10 @@
 # include <systemd/sd-journal.h>
 #endif
 
+#ifdef HAVE_LIBLASTLOG2
+# include "lastlog2.h"
+#endif
+
 #include "c.h"
 #include "nls.h"
 #include "closestream.h"
@@ -55,15 +59,16 @@
 #include "strutils.h"
 #include "optutils.h"
 #include "pathnames.h"
+#include "fileutils.h"
 #include "logindefs.h"
-#include "procutils.h"
+#include "procfs.h"
 #include "timeutils.h"
 
 /*
  * column description
  */
 struct lslogins_coldesc {
-	const char *name;
+	const char * const name;
 	const char *help;
 	const char *pretty_name;
 
@@ -225,7 +230,7 @@ static const struct lslogins_coldesc coldescs[] =
 {
 	[COL_USER]          = { "USER",		N_("user name"), N_("Username"), 0.1, SCOLS_FL_NOEXTREMES },
 	[COL_UID]           = { "UID",		N_("user ID"), "UID", 1, SCOLS_FL_RIGHT},
-	[COL_PWDEMPTY]      = { "PWD-EMPTY",	N_("password not required"), N_("Password not required"), 1, SCOLS_FL_RIGHT },
+	[COL_PWDEMPTY]      = { "PWD-EMPTY",	N_("password not defined"), N_("Password not required (empty)"), 1, SCOLS_FL_RIGHT },
 	[COL_PWDDENY]       = { "PWD-DENY",	N_("login by password disabled"), N_("Login by password disabled"), 1, SCOLS_FL_RIGHT },
 	[COL_PWDLOCK]       = { "PWD-LOCK",	N_("password defined, but locked"), N_("Password is locked"), 1, SCOLS_FL_RIGHT },
 	[COL_PWDMETHOD]     = { "PWD-METHOD",   N_("password encryption method"), N_("Password encryption method"), 0.1 },
@@ -261,6 +266,10 @@ struct lslogins_control {
 
 	int lastlogin_fd;
 
+#ifdef HAVE_LIBLASTLOG2
+	const char *lastlog2_path;
+#endif
+
 	void *usertree;
 
 	uid_t uid;
@@ -280,6 +289,7 @@ struct lslogins_control {
 	unsigned int selinux_enabled : 1,
 		     fail_on_unknown : 1,		/* fail if user does not exist */
 		     ulist_on : 1,
+		     shellvar : 1,
 		     noheadings : 1,
 		     notrunc : 1;
 };
@@ -474,61 +484,123 @@ static struct utmpx *get_last_btmp(struct lslogins_control *ctl, const char *use
 
 }
 
-static int read_utmp(char const *file, size_t *nents, struct utmpx **res)
+static int parse_utmpx(const char *path, size_t *nrecords, struct utmpx **records)
 {
-	size_t n_read = 0, n_alloc = 0;
-	struct utmpx *utmp = NULL, *u;
+	size_t i, imax = 1;
+	struct utmpx *ary = NULL;
+	struct stat st;
 
-	if (utmpxname(file) < 0)
+	*nrecords = 0;
+	*records = NULL;
+
+	if (utmpxname(path) < 0)
 		return -errno;
 
-	setutxent();
-	errno = 0;
+	/* optimize allocation according to file size, the realloc() below is
+	 * just fallback only */
+	if (stat(path, &st) == 0) {
+		if ((size_t) st.st_size >= sizeof(struct utmpx)) {
+			imax = st.st_size / sizeof(struct utmpx);
+			ary = xreallocarray(NULL, imax, sizeof(struct utmpx));
+		} else
+			return -ENODATA;
+	} else
+		return -errno;
 
-	while ((u = getutxent()) != NULL) {
-		if (n_read == n_alloc) {
-			n_alloc += 32;
-			utmp = xrealloc(utmp, n_alloc * sizeof (struct utmpx));
+	for (i = 0; ; i++) {
+		struct utmpx *u;
+		errno = 0;
+		u = getutxent();
+		if (!u) {
+			if (errno)
+				goto fail;
+			break;
 		}
-		utmp[n_read++] = *u;
+		if (i == imax)
+			ary = xreallocarray(ary, imax *= 2, sizeof(struct utmpx));
+		ary[i] = *u;
 	}
-	if (!u && errno) {
-		free(utmp);
+
+	*nrecords = i;
+	*records = ary;
+	endutxent();
+	return 0;
+fail:
+	endutxent();
+	free(ary);
+	if (errno) {
+		if (errno != EACCES)
+			err(EXIT_FAILURE, "%s", path);
 		return -errno;
 	}
+	return -EINVAL;
+}
 
-	endutxent();
+#ifdef HAVE_LIBLASTLOG2
+static int get_lastlog2(struct lslogins_control *ctl, const char *user, void *dst, int what)
+{
+	struct ll2_context *context = ll2_new_context(ctl->lastlog2_path);
 
-	*nents = n_read;
-	*res = utmp;
+	switch (what) {
+	case LASTLOG_TIME: {
+		time_t *t = dst;
+		int64_t res_time = 0;
 
+		if (ll2_read_entry(context, user, &res_time, NULL, NULL, NULL, NULL) != 0) {
+			ll2_unref_context(context);
+			return -1;
+		}
+		*t = res_time;
+		break;
+	}
+	case LASTLOG_LINE: {
+		char *res_tty = NULL;
+
+		if (ll2_read_entry(context, user, NULL, &res_tty, NULL, NULL, NULL) != 0) {
+			ll2_unref_context(context);
+			return -1;
+		}
+		if (res_tty) {
+			mem2strcpy(dst, res_tty, strlen(res_tty), strlen(res_tty) + 1);
+			free (res_tty);
+		}
+		break;
+	}
+	case LASTLOG_HOST: {
+		char *res_host = NULL;
+
+		if (ll2_read_entry(context, user, NULL, NULL, &res_host, NULL, NULL) != 0) {
+			ll2_unref_context(context);
+			return -1;
+		}
+		if (res_host) {
+			mem2strcpy(dst, res_host, strlen(res_host), strlen(res_host) + 1);
+			free(res_host);
+		}
+		break;
+	}
+	default:
+		abort();
+	}
+	ll2_unref_context(context);
 	return 0;
 }
+#endif
 
-static int parse_wtmp(struct lslogins_control *ctl, char *path)
-{
-	int rc = 0;
-
-	rc = read_utmp(path, &ctl->wtmp_size, &ctl->wtmp);
-	if (rc < 0 && errno != EACCES)
-		err(EXIT_FAILURE, "%s", path);
-	return rc;
-}
-
-static int parse_btmp(struct lslogins_control *ctl, char *path)
-{
-	int rc = 0;
-
-	rc = read_utmp(path, &ctl->btmp_size, &ctl->btmp);
-	if (rc < 0 && errno != EACCES)
-		err(EXIT_FAILURE, "%s", path);
-	return rc;
-}
-
-static void get_lastlog(struct lslogins_control *ctl, uid_t uid, void *dst, int what)
+static void get_lastlog(struct lslogins_control *ctl, uid_t uid,
+#ifdef HAVE_LIBLASTLOG2
+			const char *user,
+#else
+			const char *user __attribute__((__unused__)),
+#endif
+			void *dst, int what)
 {
 	struct lastlog ll;
 
+#ifdef HAVE_LIBLASTLOG2
+	if (get_lastlog2(ctl, user, dst, what) >= 0)
+		return;
+#endif
 	if (ctl->lastlogin_fd < 0 ||
 	    pread(ctl->lastlogin_fd, (void *)&ll, sizeof(ll), uid * sizeof(ll)) != sizeof(ll))
 		return;
@@ -587,21 +659,25 @@ static int get_sgroups(gid_t **list, size_t *len, struct passwd *pwd)
 #ifdef __linux__
 static int get_nprocs(const uid_t uid)
 {
+	DIR *dir;
+	struct dirent *d;
 	int nprocs = 0;
-	pid_t pid;
-	struct proc_processes *proc = proc_open_processes();
 
-	proc_processes_filter_by_uid(proc, uid);
+	dir = opendir(_PATH_PROC);
+	if (!dir)
+		return 0;
 
-	while (!proc_next_pid(proc, &pid))
-		++nprocs;
+	while ((d = xreaddir(dir))) {
+		if (procfs_dirent_match_uid(dir, d, uid))
+			++nprocs;
+	}
 
-	proc_close_processes(proc);
+	closedir(dir);
 	return nprocs;
 }
 #endif
 
-static const char *get_pwd_method(const char *str, const char **next, unsigned int *sz)
+static const char *get_pwd_method(const char *str, const char **next)
 {
 	const char *p = str;
 	const char *res = NULL;
@@ -609,32 +685,50 @@ static const char *get_pwd_method(const char *str, const char **next, unsigned i
 	if (!p || *p++ != '$')
 		return NULL;
 
-	if (sz)
-		*sz = 0;
-
 	switch (*p) {
 	case '1':
 		res = "MD5";
-		if (sz)
-			*sz = 22;
 		break;
 	case '2':
-		p++;
-		if (*p == 'a' || *p == 'y')
+		switch(*(p+1)) {
+		case 'a':
+		case 'y':
+			p++;
 			res = "Blowfish";
+			break;
+		case 'b':
+			p++;
+			res = "bcrypt";
+			break;
+		}
+		break;
+	case '3':
+		res = "NT";
 		break;
 	case '5':
 		res = "SHA-256";
-		if (sz)
-			*sz = 43;
 		break;
 	case '6':
 		res = "SHA-512";
-		if (sz)
-			*sz = 86;
+		break;
+	case '7':
+		res = "scrypt";
+		break;
+	case 'y':
+		res = "yescrypt";
+		break;
+	case 'g':
+		if (*(p + 1) == 'y') {
+			p++;
+			res = "gost-yescrypt";
+		}
+		break;
+	case '_':
+		res = "bsdicrypt";
 		break;
 	default:
-		return NULL;
+		res = "unknown";
+		break;
 	}
 	p++;
 
@@ -645,25 +739,27 @@ static const char *get_pwd_method(const char *str, const char **next, unsigned i
 	return res;
 }
 
-#define is_valid_pwd_char(x)	(isalnum((unsigned char) (x)) || (x) ==  '.' || (x) == '/')
+#define is_invalid_pwd_char(x)	(isspace((unsigned char) (x)) || \
+				 (x) == ':' || (x) == ';' || (x) == '*' || \
+				 (x) == '!' || (x) == '\\')
+#define is_valid_pwd_char(x)	(isascii((unsigned char) (x)) && !is_invalid_pwd_char(x))
 
 /*
- * This function do not accept empty passwords or locked accouns.
+ * This function does not accept empty passwords or locked accounts.
  */
 static int valid_pwd(const char *str)
 {
 	const char *p = str;
-	unsigned int sz = 0, n;
 
 	if (!str || !*str)
 		return 0;
 
 	/* $id$ */
-	if (get_pwd_method(str, &p, &sz) == NULL)
-		return 0;
-	if (!p || !*p)
+	if (get_pwd_method(str, &p) == NULL)
 		return 0;
 
+	if (!p || !*p)
+		return 0;
 	/* salt$ */
 	for (; *p; p++) {
 		if (*p == '$') {
@@ -673,17 +769,15 @@ static int valid_pwd(const char *str)
 		if (!is_valid_pwd_char(*p))
 			return 0;
 	}
+
 	if (!*p)
 		return 0;
-
 	/* encrypted */
-	for (n = 0; *p; p++, n++) {
-		if (!is_valid_pwd_char(*p))
+	for (; *p; p++) {
+		if (!is_valid_pwd_char(*p)) {
 			return 0;
+		}
 	}
-
-	if (sz && n != sz)
-		return 0;
 	return 1;
 }
 
@@ -757,7 +851,8 @@ static struct lslogins_user *get_user_info(struct lslogins_control *ctl, const c
 			break;
 		case COL_SGROUPS:
 		case COL_SGIDS:
-			if (get_sgroups(&user->sgroups, &user->nsgroups, pwd))
+			if (!user->nsgroups &&
+			    get_sgroups(&user->sgroups, &user->nsgroups, pwd) < 0)
 				err(EXIT_FAILURE, _("failed to get supplementary groups"));
 			break;
 		case COL_HOME:
@@ -775,7 +870,7 @@ static struct lslogins_user *get_user_info(struct lslogins_control *ctl, const c
 				user->last_login = make_time(ctl->time_mode, time);
 			} else {
 				time = 0;
-				get_lastlog(ctl, pwd->pw_uid, &time, LASTLOG_TIME);
+				get_lastlog(ctl, pwd->pw_uid, pwd->pw_name, &time, LASTLOG_TIME);
 				if (time)
 					user->last_login = make_time(ctl->time_mode, time);
 			}
@@ -787,7 +882,7 @@ static struct lslogins_user *get_user_info(struct lslogins_control *ctl, const c
 						sizeof(user_wtmp->ut_line),
 						sizeof(user_wtmp->ut_line) + 1);;
 			}  else
-				get_lastlog(ctl, user->uid, user->last_tty, LASTLOG_LINE);
+				get_lastlog(ctl, user->uid, user->login, user->last_tty, LASTLOG_LINE);
 			break;
 		case COL_LAST_HOSTNAME:
 			user->last_hostname = xcalloc(1, sizeof(user_wtmp->ut_host) + 1);
@@ -796,7 +891,7 @@ static struct lslogins_user *get_user_info(struct lslogins_control *ctl, const c
 						sizeof(user_wtmp->ut_host),
 						sizeof(user_wtmp->ut_host) + 1);;
 			}  else
-				get_lastlog(ctl, user->uid, user->last_hostname, LASTLOG_HOST);
+				get_lastlog(ctl, user->uid, user->login, user->last_hostname, LASTLOG_HOST);
 			break;
 		case COL_FAILED_LOGIN:
 			if (user_btmp) {
@@ -813,29 +908,48 @@ static struct lslogins_user *get_user_info(struct lslogins_control *ctl, const c
 			}
 			break;
 		case COL_HUSH_STATUS:
-			user->hushed = get_hushlogin_status(pwd, 0);
+			user->hushed = get_hushlogin_status(pwd, /* override_home= */ NULL, 0);
 			if (user->hushed == -1)
 				user->hushed = STATUS_UNKNOWN;
 			break;
 		case COL_PWDEMPTY:
 			if (shadow) {
-				if (!*shadow->sp_pwdp) /* '\0' */
+				const char *p = shadow->sp_pwdp;
+
+				while (p && (*p == '!' || *p == '*'))
+					p++;
+
+				if (!p || !*p)
 					user->pwd_empty = STATUS_TRUE;
 			} else
 				user->pwd_empty = STATUS_UNKNOWN;
 			break;
 		case COL_PWDDENY:
 			if (shadow) {
-				if ((*shadow->sp_pwdp == '!' ||
-				     *shadow->sp_pwdp == '*') &&
-				    !valid_pwd(shadow->sp_pwdp + 1))
+				const char *p = shadow->sp_pwdp;
+
+				while (p && (*p == '!' || *p == '*'))
+					p++;
+
+				if (p && *p && p != shadow->sp_pwdp && !valid_pwd(p))
 					user->pwd_deny = STATUS_TRUE;
 			} else
 				user->pwd_deny = STATUS_UNKNOWN;
 			break;
 		case COL_PWDLOCK:
 			if (shadow) {
-				if (*shadow->sp_pwdp == '!' && valid_pwd(shadow->sp_pwdp + 1))
+				const char *p = shadow->sp_pwdp;
+				int i = 0;
+
+				/* 'passwd --lock' uses two exclamation marks,
+				 * shadow(5) describes the lock as "field which
+				 * starts with an exclamation mark". Let's
+				 * support more '!' ...
+				 */
+				while (p && *p == '!')
+					p++, i++;
+
+				if (i != 0 && (!*p || valid_pwd(p)))
 					user->pwd_lock = STATUS_TRUE;
 			} else
 				user->pwd_lock = STATUS_UNKNOWN;
@@ -844,9 +958,9 @@ static struct lslogins_user *get_user_info(struct lslogins_control *ctl, const c
 			if (shadow) {
 				const char *p = shadow->sp_pwdp;
 
-				if (*p == '!' || *p == '*')
+				while (p && (*p == '!' || *p == '*'))
 					p++;
-				user->pwd_method = get_pwd_method(p, NULL, NULL);
+				user->pwd_method = get_pwd_method(p, NULL);
 			} else
 				user->pwd_method = NULL;
 			break;
@@ -908,11 +1022,14 @@ static struct lslogins_user *get_user_info(struct lslogins_control *ctl, const c
 
 static int str_to_uint(char *s, unsigned int *ul)
 {
-	char *end;
+	char *end = NULL;
+
 	if (!s || !*s)
 		return -1;
+
+	errno = 0;
 	*ul = strtoul(s, &end, 0);
-	if (!*end)
+	if (errno == 0 && end && !*end)
 		return 0;
 	return 1;
 }
@@ -949,7 +1066,7 @@ static int get_ulist(struct lslogins_control *ctl, char *logins, char *groups)
 			(*ar)[i++] = xstrdup(u);
 
 			if (i == *arsiz)
-				*ar = xrealloc(*ar, sizeof(char *) * (*arsiz += 32));
+				*ar = xreallocarray(*ar, *arsiz += 32, sizeof(char *));
 		}
 		ctl->ulist_on = 1;
 	}
@@ -974,7 +1091,7 @@ static int get_ulist(struct lslogins_control *ctl, char *logins, char *groups)
 				(*ar)[i++] = xstrdup(u);
 
 				if (i == *arsiz)
-					*ar = xrealloc(*ar, sizeof(char *) * (*arsiz += 32));
+					*ar = xreallocarray(*ar, *arsiz += 32, sizeof(char *));
 			}
 		}
 		ctl->ulist_on = 1;
@@ -986,6 +1103,9 @@ static int get_ulist(struct lslogins_control *ctl, char *logins, char *groups)
 static void free_ctl(struct lslogins_control *ctl)
 {
 	size_t n = 0;
+
+	if (!ctl)
+		return;
 
 	free(ctl->wtmp);
 	free(ctl->btmp);
@@ -1048,7 +1168,6 @@ static int create_usertree(struct lslogins_control *ctl)
 			}
 			if (rc || !user)
 				continue;
-
 			tsearch(user, &ctl->usertree, cmp_uid);
 		}
 	} else {
@@ -1067,6 +1186,8 @@ static struct libscols_table *setup_table(struct lslogins_control *ctl)
 		err(EXIT_FAILURE, _("failed to allocate output table"));
 	if (ctl->noheadings)
 		scols_table_enable_noheadings(table, 1);
+	if (ctl->shellvar)
+		scols_table_enable_shellvar(table, 1);
 
 	switch(outmode) {
 	case OUT_COLON:
@@ -1231,14 +1352,28 @@ static void fill_table(const void *u, const VISIT which, const int depth __attri
 	}
 }
 #ifdef HAVE_LIBSYSTEMD
+static char *get_journal_data(sd_journal *j, const char *name)
+{
+	const char *data = NULL, *p;
+	size_t len = 0;
+
+	if (sd_journal_get_data(j, name, (const void **) &data, &len) < 0
+	    || !data || !len)
+		return NULL;
+
+	/* Get rid of journal entry field identifiers */
+	p = strnchr(data, len, '=');
+	if (!p || !*(p + 1))
+		return NULL;
+	p++;
+
+	return xstrndup(p, len - (p - data));
+}
+
 static void print_journal_tail(const char *journal_path, uid_t uid, size_t len, int time_mode)
 {
 	sd_journal *j;
-	char *match, *timestamp;
-	uint64_t x;
-	time_t t;
-	const char *identifier, *pid, *message;
-	size_t identifier_len, pid_len, message_len;
+	char *match;
 
 	if (journal_path)
 		sd_journal_open_directory(&j, journal_path, 0);
@@ -1252,30 +1387,27 @@ static void print_journal_tail(const char *journal_path, uid_t uid, size_t len, 
 	sd_journal_previous_skip(j, len);
 
 	do {
-		if (0 > sd_journal_get_data(j, "SYSLOG_IDENTIFIER",
-				(const void **) &identifier, &identifier_len))
-			goto done;
-		if (0 > sd_journal_get_data(j, "_PID",
-				(const void **) &pid, &pid_len))
-			goto done;
-		if (0 > sd_journal_get_data(j, "MESSAGE",
-				(const void **) &message, &message_len))
-			goto done;
+		char *id, *pid, *msg, *ts;
+		uint64_t x;
+		time_t t;
 
 		sd_journal_get_realtime_usec(j, &x);
 		t = x / 1000000;
-		timestamp = make_time(time_mode, t);
-		/* Get rid of journal entry field identifiers */
-		identifier = strchr(identifier, '=') + 1;
-		pid = strchr(pid, '=') + 1;
-		message = strchr(message, '=') + 1;
+		ts = make_time(time_mode, t);
 
-		fprintf(stdout, "%s %s[%s]: %s\n", timestamp, identifier, pid,
-			message);
-		free(timestamp);
+		id = get_journal_data(j, "SYSLOG_IDENTIFIER");
+		pid = get_journal_data(j, "_PID");
+		msg = get_journal_data(j, "MESSAGE");
+
+		if (ts && id && pid && msg)
+			fprintf(stdout, "%s %s[%s]: %s\n", ts, id, pid, msg);
+
+		free(ts);
+		free(id);
+		free(pid);
+		free(msg);
 	} while (sd_journal_next(j));
 
-done:
 	free(match);
 	sd_journal_flush_matches(j);
 	sd_journal_close(j);
@@ -1333,6 +1465,7 @@ static void free_user(void *f)
 	struct lslogins_user *u = f;
 	free(u->login);
 	free(u->group);
+	free(u->nprocs);
 	free(u->gecos);
 	free(u->sgroups);
 	free(u->pwd_ctime);
@@ -1398,24 +1531,28 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_("     --notruncate         don't truncate output\n"), out);
 	fputs(_(" -o, --output[=<list>]    define the columns to output\n"), out);
 	fputs(_("     --output-all         output all columns\n"), out);
-	fputs(_(" -p, --pwd                display information related to login by password.\n"), out);
+	fputs(_(" -p, --pwd                display information related to login by password\n"), out);
 	fputs(_(" -r, --raw                display in raw mode\n"), out);
 	fputs(_(" -s, --system-accs        display system accounts\n"), out);
 	fputs(_("     --time-format=<type> display dates in short, full or iso format\n"), out);
 	fputs(_(" -u, --user-accs          display user accounts\n"), out);
+	fputs(_(" -y, --shell              use column names to be usable as shell variable identifiers\n"), out);
 	fputs(_(" -Z, --context            display SELinux contexts\n"), out);
 	fputs(_(" -z, --print0             delimit user entries with a nul character\n"), out);
 	fputs(_("     --wtmp-file <path>   set an alternate path for wtmp\n"), out);
 	fputs(_("     --btmp-file <path>   set an alternate path for btmp\n"), out);
 	fputs(_("     --lastlog <path>     set an alternate path for lastlog\n"), out);
+#ifdef HAVE_LIBLASTLOG2
+	fputs(_("     --lastlog2 <path>    set an alternate path for lastlog2\n"), out);
+#endif
 	fputs(USAGE_SEPARATOR, out);
-	printf(USAGE_HELP_OPTIONS(26));
+	fprintf(out, USAGE_HELP_OPTIONS(26));
 
 	fputs(USAGE_COLUMNS, out);
 	for (i = 0; i < ARRAY_SIZE(coldescs); i++)
 		fprintf(out, " %14s  %s\n", coldescs[i].name, _(coldescs[i].help));
 
-	printf(USAGE_MAN_TAIL("lslogins(1)"));
+	fprintf(out, USAGE_MAN_TAIL("lslogins(1)"));
 
 	exit(EXIT_SUCCESS);
 }
@@ -1433,6 +1570,9 @@ int main(int argc, char *argv[])
 		OPT_WTMP = CHAR_MAX + 1,
 		OPT_BTMP,
 		OPT_LASTLOG,
+#ifdef HAVE_LIBLASTLOG2
+		OPT_LASTLOG2,
+#endif
 		OPT_NOTRUNC,
 		OPT_NOHEAD,
 		OPT_TIME_FMT,
@@ -1443,6 +1583,7 @@ int main(int argc, char *argv[])
 		{ "acc-expiration", no_argument,	0, 'a' },
 		{ "colon-separate", no_argument,	0, 'c' },
 		{ "export",         no_argument,	0, 'e' },
+		{ "shell",          no_argument,        0, 'y' },
 		{ "failed",         no_argument,	0, 'f' },
 		{ "groups",         required_argument,	0, 'g' },
 		{ "help",           no_argument,	0, 'h' },
@@ -1464,6 +1605,9 @@ int main(int argc, char *argv[])
 		{ "wtmp-file",      required_argument,	0, OPT_WTMP },
 		{ "btmp-file",      required_argument,	0, OPT_BTMP },
 		{ "lastlog-file",   required_argument,	0, OPT_LASTLOG },
+#ifdef HAVE_LIBLASTLOG2
+		{ "lastlog2-file",  required_argument,	0, OPT_LASTLOG2 },
+#endif
 #ifdef HAVE_LIBSELINUX
 		{ "context",        no_argument,	0, 'Z' },
 #endif
@@ -1492,7 +1636,7 @@ int main(int argc, char *argv[])
 	add_column(columns, ncolumns++, COL_UID);
 	add_column(columns, ncolumns++, COL_USER);
 
-	while ((c = getopt_long(argc, argv, "acefGg:hLl:no:prsuVzZ",
+	while ((c = getopt_long(argc, argv, "acefGg:hLl:no:prsuVyzZ",
 				longopts, NULL)) != -1) {
 
 		err_exclusive_options(c, longopts, excl, excl_st);
@@ -1568,12 +1712,20 @@ int main(int argc, char *argv[])
 			add_column(columns, ncolumns++, COL_HUSH_STATUS);
 			add_column(columns, ncolumns++, COL_PWDMETHOD);
 			break;
+		case 'y':
+			ctl->shellvar = 1;
+			break;
 		case 'z':
 			outmode = OUT_NUL;
 			break;
 		case OPT_LASTLOG:
 			path_lastlog = optarg;
 			break;
+#ifdef HAVE_LIBLASTLOG2
+		case OPT_LASTLOG2:
+			ctl->lastlog2_path = optarg;
+			break;
+#endif
 		case OPT_WTMP:
 			path_wtmp = optarg;
 			break;
@@ -1590,7 +1742,15 @@ int main(int argc, char *argv[])
 			ctl->time_mode = parse_time_mode(optarg);
 			break;
 		case 'V':
-			print_version(EXIT_SUCCESS);
+		{
+			static const char *const features[] = {
+#ifdef HAVE_LIBLASTLOG2
+				"lastlog2",
+#endif
+				NULL
+			};
+			print_version_with_features(EXIT_SUCCESS, features);
+		}
 		case 'Z':
 		{
 #ifdef HAVE_LIBSELINUX
@@ -1644,11 +1804,11 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 
 	if (require_wtmp()) {
-		parse_wtmp(ctl, path_wtmp);
+		parse_utmpx(path_wtmp, &ctl->wtmp_size, &ctl->wtmp);
 		ctl->lastlogin_fd = open(path_lastlog, O_RDONLY, 0);
 	}
 	if (require_btmp())
-		parse_btmp(ctl, path_btmp);
+		parse_utmpx(path_btmp, &ctl->btmp_size, &ctl->btmp);
 
 	if (logins || groups)
 		get_ulist(ctl, logins, groups);

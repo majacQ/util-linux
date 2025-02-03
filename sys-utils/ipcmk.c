@@ -76,12 +76,12 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" -p, --mode <mode>        permission for the resource (default is 0644)\n"), out);
 
 	fputs(USAGE_SEPARATOR, out);
-	printf(USAGE_HELP_OPTIONS(26));
+	fprintf(out, USAGE_HELP_OPTIONS(26));
 
 	fputs(USAGE_ARGUMENTS, out);
-	printf(USAGE_ARG_SIZE(_("<size>")));
+	fprintf(out, USAGE_ARG_SIZE(_("<size>")));
 
-	printf(USAGE_MAN_TAIL("ipcmk(1)"));
+	fprintf(out, USAGE_MAN_TAIL("ipcmk(1)"));
 
 	exit(EXIT_SUCCESS);
 }
@@ -122,9 +122,14 @@ int main(int argc, char **argv)
 			ask_sem = 1;
 			break;
 		case 'p':
-			permission = strtoul(optarg, NULL, 8);
+		{
+			char *end = NULL;
+			errno = 0;
+			permission = strtoul(optarg, &end, 8);
+			if (errno || optarg == end || (end && *end))
+				err(EXIT_FAILURE, _("failed to parse mode"));
 			break;
-
+		}
 		case 'h':
 			usage();
 		case 'V':

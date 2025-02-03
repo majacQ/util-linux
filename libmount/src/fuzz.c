@@ -4,13 +4,16 @@
 
 #include <stdlib.h>
 #include <stddef.h>
-#include <stdint.h>
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         struct libmnt_table *tb = NULL;
         FILE *f = NULL;
 
         if (size == 0)
+                return 0;
+
+        // 128Kb should be enough to trigger all the issues we're interested in
+        if (size > 131072)
                 return 0;
 
         tb = mnt_new_table();

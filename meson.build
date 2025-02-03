@@ -1,72 +1,88 @@
 project('util-linux', 'c',
-        version : '2.37',
-        license : 'GPLv2+')
+        version : run_command('tools/git-version-gen', check: true).stdout(),
+        meson_version: '>=0.60.0',
+        license : 'GPLv2+',
+        default_options : [
+          'c_std=c99',
+          'cpp_std=c++11',
+        ])
 
+fs = import('fs')
 pkgconfig = import('pkgconfig')
 
+# soname versions; This never change because we use symbol versioning. There is also
+# API version (LIB*_VERSION macros) and it follow package version.
 libblkid_version = '1.1.0'
 libblkid_date = '01-Jun-2021'
 libuuid_version = '1.3.0'
+liblastlog2_version = '2.0.0'
 libmount_version = '1.1.0'
 libsmartcols_version = '1.1.0'
 libfdisk_version = '1.1.0'
 
 prefixdir = get_option('prefix')
-if not prefixdir.startswith('/')
+if not fs.is_absolute(prefixdir)
         error('Prefix is not absolute: "@0@"'.format(prefixdir))
 endif
-bindir = join_paths(prefixdir, get_option('bindir'))
-sbindir = join_paths(prefixdir, get_option('sbindir'))
-sysconfstaticdir = join_paths(prefixdir, 'lib')
-docdir = '/usr/share/doc/util-linux'
-mandir = join_paths(prefixdir, get_option('mandir'))
+bindir = prefixdir / get_option('bindir')
+sbindir = prefixdir / get_option('sbindir')
+sysconfstaticdir = prefixdir / 'lib'
+docdir = prefixdir / get_option('datadir') / 'doc' / 'util-linux'
+mandir = prefixdir / get_option('mandir')
 runstatedir = '/run'
-execprefixdir = '/usr'
-usrbin_exec_dir = join_paths(execprefixdir, 'bin')
-usrsbin_exec_dir = join_paths(execprefixdir, 'sbin')
-sysconfdir = '/etc'
 localstatedir = '/var'
+execprefixdir = prefixdir
+sysconfdir = prefixdir / get_option('sysconfdir')
+usrbin_exec_dir = execprefixdir / bindir
+usrsbin_exec_dir = execprefixdir / sbindir
+bash_completion = dependency('bash-completion', required : get_option('build-bash-completion'))
 
 vendordir = get_option('vendordir')
 
-add_project_arguments('-D_GNU_SOURCE', language : 'c')
+add_project_arguments('-D_GNU_SOURCE', '-fsigned-char', language : 'c')
+
+if host_machine.system() == 'darwin'
+  add_project_arguments('-D_DARWIN_C_SOURCE', language : 'c')
+endif
 
 cc = meson.get_compiler('c')
 
 conf = configuration_data()
+conf.set_quoted('PACKAGE', meson.project_name())
+conf.set_quoted('PACKAGE_VERSION', meson.project_version())
 package_string = '@0@ @1@'.format(meson.project_name(), meson.project_version())
 conf.set_quoted('PACKAGE_STRING', package_string)
-conf.set_quoted('PACKAGE_VERSION', meson.project_version())
 
-codes = [''' {print $1}  ''',
-         ''' {sub("-.*","",$2); print $2} ''',
-         ''' {sub("-.*","",$3); print $3 ~ /^@<:@0-9@:>@+$/ ? $3 : 0} ''']
 pc_version = []
-foreach code : codes
-  res = run_command('bash', '-c',
-                    '''echo '@0@' | awk -F. '@1@' '''.format(
-                      meson.project_version(), code))
-  pc_version += res.stdout().strip()
-endforeach
+pc_version = meson.project_version().split('-')[0].split('.')
+
+if pc_version.length() < 3
+    pc_version += '0'
+endif
+
 pc_version = '.'.join(pc_version)
 
-conf.set_quoted('LIBBLKID_VERSION', libblkid_version)
+conf.set_quoted('LIBBLKID_VERSION', pc_version)
 conf.set_quoted('LIBBLKID_DATE', libblkid_date)
 
 conf.set('bindir', bindir)
 conf.set('sbindir', sbindir)
 conf.set('runstatedir', runstatedir)
+conf.set('localstatedir', localstatedir)
+conf.set('sysconfdir', sysconfdir)
+conf.set('usrbin_execdir', usrbin_exec_dir)
 conf.set('usrsbin_execdir', usrsbin_exec_dir)
 conf.set('docdir', docdir)
 conf.set_quoted('_PATH_SYSCONFSTATICDIR', sysconfstaticdir)
 conf.set_quoted('_PATH_RUNSTATEDIR', runstatedir)
+conf.set_quoted('_PATH_LOCALSTATEDIR', localstatedir)
 conf.set_quoted('CONFIG_ADJTIME_PATH', '/etc/adjtime')
 conf.set_quoted('ADJTIME_PATH', '/etc/adjtime') # yes, both are used :(
 
 conf.set_quoted('_PATH_VENDORDIR', vendordir)
 conf.set('USE_VENDORDIR', vendordir == '' ? false : 1)
 
-build_libblkid = not get_option('build-libblkid').disabled()
+build_libblkid = get_option('build-libblkid').allowed()
 conf.set('HAVE_LIBBLKID', build_libblkid ? 1 : false)
 summary('libblkid', build_libblkid ? 'enabled' : 'disabled', section : 'components')
 
@@ -74,15 +90,58 @@ build_libuuid = not get_option('build-libuuid').disabled()
 conf.set('HAVE_LIBUUID', build_libuuid ? 1 : false)
 summary('libuuid', build_libuuid ? 'enabled' : 'disabled', section : 'components')
 
-build_libmount = not get_option('build-libmount').disabled()
+lib_sqlite3 = dependency('sqlite3', required : get_option('build-liblastlog2'))
+build_liblastlog2 = get_option('build-liblastlog2').require(lib_sqlite3.found()).allowed()
+conf.set('HAVE_LIBLASTLOG2', build_liblastlog2 ? 1 : false)
+summary('liblastlog2', build_liblastlog2 ? 'enabled' : 'disabled', section : 'components')
+
+login_lastlogin = get_option('login-lastlogin')
+conf.set('USE_LOGIN_LASTLOG', login_lastlogin ? 1 : false)
+summary('login-lastlogin', login_lastlogin ? 'enabled' : 'disabled', section : 'components')
+
+have_mountfd_api = cc.has_type('struct mount_attr', prefix : '#include <linux/mount.h>')
+conf.set('HAVE_STRUCT_MOUNT_ATTR', have_mountfd_api ? 1 : false)
+conf.set('HAVE_MOUNTFD_API', have_mountfd_api ? 1 : false)
+
+
+have_struct_statx = cc.has_type('struct statx', prefix : '#include <sys/stat.h>')
+conf.set('HAVE_STRUCT_STATX', have_struct_statx ? 1 : false)
+have = cc.has_member('struct statx', 'stx_mnt_id',
+                     prefix : '#include <linux/stat.h>')
+conf.set('HAVE_STRUCT_STATX_STX_MNT_ID', have ? 1 : false)
+
+
+have_statmount = cc.has_type('struct statmount', prefix : '#include <linux/mount.h>')
+have_listmount = cc.has_header_symbol('linux/mount.h', 'LSMT_ROOT')
+
+# kernel headers provides the syscall, but there is not SYS_xxx yet
+if have_statmount and not cc.has_header_symbol('bits/syscall.h', 'SYS_statmount')
+  conf.set('SYS_statmount', '__NR_statmount')
+endif
+if have_listmount and not cc.has_header_symbol('bits/syscall.h', 'SYS_listmount')
+  conf.set('SYS_listmount', '__NR_listmount')
+endif
+
+conf.set('HAVE_STATMOUNT_API', have_statmount and have_listmount ? 1 : false)
+
+
+have_sys_vfs_header = cc.has_header('sys/vfs.h')
+
+build_libmount = get_option('build-libmount').require(
+  get_option('build-libblkid').allowed() \
+  and have_sys_vfs_header \
+).allowed()
+
 conf.set('HAVE_LIBMOUNT', build_libmount ? 1 : false)
+conf.set('USE_LIBMOUNT_SUPPORT_NAMESPACES', 1)
+conf.set('USE_LIBMOUNT_MOUNTFD_SUPPORT', have_mountfd_api ? 1 : false)
 summary('libmount', build_libmount ? 'enabled' : 'disabled', section : 'components')
 
 build_libsmartcols = not get_option('build-libsmartcols').disabled()
 conf.set('HAVE_LIBSMARTCOLS', build_libsmartcols ? 1 : false)
 summary('libsmartcols', build_libsmartcols ? 'enabled' : 'disabled', section : 'components')
 
-build_libfdisk = not get_option('build-libfdisk').disabled()
+build_libfdisk = not get_option('build-libfdisk').require(get_option('build-libblkid').allowed()).disabled()
 conf.set('HAVE_LIBFDISK', build_libfdisk ? 1 : false)
 summary('libfdisk', build_libfdisk ? 'enabled' : 'disabled', section : 'components')
 
@@ -156,11 +215,16 @@ headers = '''
         linux/compiler.h
         linux/falloc.h
         linux/fd.h
+        linux/fs.h
 	linux/fiemap.h
 	linux/gsmmux.h
+        linux/if_alg.h
+        linux/landlock.h
+        linux/kcmp.h
         linux/net_namespace.h
         linux/nsfs.h
-        linux/raw.h
+        linux/mount.h
+        linux/pr.h
         linux/securebits.h
         linux/tiocl.h
         linux/version.h
@@ -171,6 +235,7 @@ headers = '''
         security/openpam.h
         security/pam_appl.h
         security/pam_misc.h
+        security/pam_modules.h
         sys/disk.h
         sys/disklabel.h
         sys/endian.h
@@ -181,6 +246,7 @@ headers = '''
         sys/mkdev.h
         sys/mount.h
         sys/param.h
+        sys/pidfd.h
         sys/prctl.h
         sys/resource.h
 	sys/sendfile.h
@@ -188,6 +254,7 @@ headers = '''
         sys/socket.h
         sys/sockio.h
         sys/stat.h
+        sys/statfs.h
         sys/swap.h
         sys/syscall.h
         sys/sysmacros.h
@@ -197,6 +264,7 @@ headers = '''
         sys/types.h
         sys/ucred.h
         sys/un.h
+        sys/vfs.h
 	sys/xattr.h
 '''.split()
 
@@ -204,12 +272,8 @@ lib_m = cc.find_library('m')
 
 lib_tinfo = dependency(
   'tinfo',
+  disabler : true,
   required : get_option('tinfo'))
-
-lib_tinfo_static = dependency(
-  'tinfo',
-  static : true,
-  required : need_static_libs ? get_option('tinfo') : disabler())
 
 lib_ncursesw = dependency(
   'ncursesw',
@@ -223,6 +287,7 @@ if lib_ncursesw.found()
 else
   lib_ncurses = dependency(
     'ncurses',
+    disabler : true,
     required : get_option('ncurses'))
   headers += ['ncurses.h',
               'term.h']
@@ -255,6 +320,7 @@ endforeach
 
 lib_z = dependency(
   'zlib',
+  disabler : true,
   required : get_option('zlib'))
 
 lib_readline = dependency(
@@ -267,10 +333,17 @@ lib_readline_static = dependency(
   static : true,
   required : need_static_libs ? get_option('readline') : disabler())
 
-lib_pcre = dependency(
-  'libpcre2-posix',
-  required : get_option('libpcre2-posix'))
-conf.set('HAVE_PCRE2_POSIX', lib_pcre.found() ? 1 : false)
+if meson.version().version_compare('>= 0.59.0')
+  lib_intl = dependency(
+    'intl',
+    required : get_option('nls'))
+  conf.set('ENABLE_NLS', lib_intl.found() ? 1 : false)
+else
+  if get_option('nls').enabled()
+    error('nls is not supported with meson before 0.59.0')
+  endif
+  lib_intl = dependency('', required : false)
+endif
 
 lib_user = dependency(
   'libuser',
@@ -296,18 +369,39 @@ lib_systemd = dependency(
   'libsystemd',
   required : get_option('systemd'))
 conf.set('HAVE_LIBSYSTEMD', lib_systemd.found() ? 1 : false)
+conf.set('USE_SYSTEMD', lib_systemd.found() ? 1 : false)
+
+have = cc.has_function(
+  'sd_session_get_username',
+  dependencies : lib_systemd)
+conf.set('HAVE_DECL_SD_SESSION_GET_USERNAME', have ? 1 : false)
 
 lib_udev = dependency(
   'libudev',
   required : get_option('systemd'))
 conf.set('HAVE_LIBUDEV', lib_udev.found() ? 1 : false)
 
-lib_crypt = cc.find_library('crypt')
+lib_crypt = cc.find_library('crypt', required : get_option('build-newgrp'))
+if not lib_crypt.found()
+  lib_crypt = cc.find_library('crypt', required : get_option('build-sulogin'))
+endif
 
-lib_pam = cc.find_library('pam')
+pam_requirement = get_option('build-login').enabled() or \
+    get_option('build-chfn-chsh').enabled() or \
+    get_option('build-su').enabled() or \
+    get_option('build-runuser').enabled()
+lib_pam = cc.find_library(
+  'pam',
+  disabler : true,
+  required : pam_requirement)
 if lib_pam.found()
-  lib_pam_misc = cc.find_library('pam_misc')
+  lib_pam_misc = cc.find_library(
+    'pam_misc',
+    disabler : true,
+    required : pam_requirement)
   lib_pam = [lib_pam, lib_pam_misc]
+else
+  lib_pam_misc = declare_dependency()
 endif
 
 lib_cryptsetup = dependency(
@@ -315,18 +409,34 @@ lib_cryptsetup = dependency(
   required : get_option('cryptsetup'))
 conf.set('HAVE_CRYPTSETUP', lib_cryptsetup.found() ? 1 : false)
 
-lib_cryptsetup_dl = dependency(
-  'dl',
-  required : get_option('cryptsetup-dlopen'))
-conf.set('CRYPTSETUP_VIA_DLOPEN', lib_cryptsetup_dl.found() ? 1 : false)
+cryptsetup_dlopen = not get_option('cryptsetup').disabled() and get_option('cryptsetup-dlopen').enabled()
+if cryptsetup_dlopen
+  if meson.version().version_compare('>= 0.62.0')
+    lib_dl = dependency('dl')
+  else
+    lib_dl = cc.find_library('dl')
+  endif
+  conf.set('CRYPTSETUP_VIA_DLOPEN', 1)
+  summary('cryptsetup support (dlopen)',
+          'enabled',
+          section : 'components')
+else
+  summary('cryptsetup support',
+          lib_cryptsetup.found()  ? 'enabled' : 'disabled',
+          section : 'components')
+endif
 
 have = cc.has_function(
   'crypt_activate_by_signed_key',
   dependencies : lib_cryptsetup)
-conf.set('HAVE_CRYPTSETUP', have ? 1 : false)
+conf.set('HAVE_CRYPT_ACTIVATE_BY_SIGNED_KEY', have ? 1 : false)
 
 lib_cap_ng = dependency(
-  'libcap-ng')
+  'libcap-ng',
+  required : get_option('build-setpriv'))
+if not lib_cap_ng.found()
+  lib_cap_ng = disabler()
+endif
 
 lib_selinux = dependency(
   'libselinux',
@@ -344,12 +454,18 @@ lib_econf = dependency(
   required : get_option('econf'))
 conf.set('HAVE_LIBECONF', lib_econf.found() ? 1 : false)
 
+have = cc.has_function(
+  'econf_readConfig',
+  dependencies : lib_econf)
+conf.set('HAVE_ECONF_READCONFIG', have ? 1 : false)
+
 lib_audit = dependency(
-  'libaudit',
+  'audit',
   required : get_option('audit'))
 conf.set('HAVE_LIBAUDIT', lib_audit.found() ? 1 : false)
 
 conf.set('HAVE_SMACK', not get_option('smack').disabled())
+
 
 foreach header : headers
   have = cc.has_header(header)
@@ -374,21 +490,26 @@ endforeach
 
 have = cc.has_header('sched.h')
 conf.set10('HAVE_DECL_CPU_ALLOC', have)
-# We get -1 if the size cannot be determined
-have_cpu_set_t = cc.sizeof('cpu_set_t', prefix : '#include <sched.h>') > 0
+have_cpu_set_t = cc.has_type('cpu_set_t', args : '-D_GNU_SOURCE', prefix : '#include <sched.h>')
 conf.set('HAVE_CPU_SET_T', have_cpu_set_t ? 1 : false)
 
-have = cc.has_header_symbol('stdlib.h', 'environ')
-conf.set10('HAVE_ENVIRON_DECL', have)
+have = cc.has_header_symbol('unistd.h', 'environ', args : '-D_GNU_SOURCE')
+conf.set('HAVE_ENVIRON_DECL', have ? 1 : false)
 
-have = cc.has_header_symbol('signal.h', 'sighandler_t')
+have = cc.has_header_symbol('signal.h', 'sighandler_t', args : '-D_GNU_SOURCE')
 conf.set('HAVE_SIGHANDLER_T', have ? 1 : false)
 
-have = cc.has_header_symbol('string.h', 'strsignal')
+have = cc.has_function('strsignal')
 conf.set10('HAVE_STRSIGNAL_DECL', have)
 
-have = cc.sizeof('union semun', prefix : '#include <sys/sem.h>') > 0
+have = cc.has_type('union semun',
+                   prefix : '#include <sys/sem.h>')
 conf.set('HAVE_UNION_SEMUN', have ? 1 : false)
+
+have = cc.has_type('loff_t',
+                   args : '-D_GNU_SOURCE',
+                   prefix : '#include <sys/types.h>')
+conf.set('HAVE_LOFF_T', have ? 1 : false)
 
 have = cc.compiles('''
    #define _GNU_SOURCE 1
@@ -436,9 +557,22 @@ have = cc.compiles('''
   name : 'langinfo.h defines _NL_ABALTMON_x constants')
 conf.set('HAVE_LANGINFO_NL_ABALTMON', have ? 1 : false)
 
+have = cc.compiles('''
+   #define _GNU_SOURCE 1
+   #include <langinfo.h>
+   int main(void) {
+        char *str;
+        str = nl_langinfo (_NL_TIME_WEEK_1STDAY);
+        return 0;
+   }
+   ''',
+  name : 'langinfo.h defines _NL_TIME_WEEK_1STDAY constant')
+conf.set('HAVE_DECL__NL_TIME_WEEK_1STDAY', have ? 1 : false)
+
 funcs = '''
+        cachestat
         clearenv
-	close_range
+        close_range
         __fpurge
         fpurge
         __fpending
@@ -448,9 +582,14 @@ funcs = '''
         err
         errx
         explicit_bzero
-        fmemopen
+        fnmatch
         fseeko
+        fsconfig
+        fsmount
+        fsopen
+        fspick
         fsync
+        getttynam
         utimensat
         getdomainname
         getdtablesize
@@ -461,23 +600,33 @@ funcs = '''
         getsgnam
         inotify_init
         jrand48
+        landlock_create_ruleset
+        landlock_add_rule
+        landlock_restrict_self
         lchown
+        lgetxattr
+        llistxattr
         llseek
-	newlocale
-        mempcpy
+        newlocale
         mkostemp
+        move_mount
+        mount_setattr
         nanosleep
         ntp_gettime
+        open_tree
         personality
+        pidfd_getfd
         pidfd_open
         pidfd_send_signal
         posix_fadvise
         prctl
         qsort_r
+        reallocarray
+        renameat2
         rpmatch
         scandirat
         setprogname
-	sendfile
+        sendfile
         setns
         setresgid
         setresuid
@@ -485,10 +634,11 @@ funcs = '''
         sched_setscheduler
         sigqueue
         srandom
+        statx
         strnchr
         strndup
         strnlen
-	strtod_l
+        strtod_l
         sysconf
         sysinfo
         swapon
@@ -496,8 +646,8 @@ funcs = '''
         timegm
         unshare
         usleep
-	uselocale
-	utimensat
+        uselocale
+        utimensat
         vwarnx
         warn
         warnx
@@ -523,6 +673,9 @@ foreach func: funcs
   conf.set('HAVE_' + func.to_upper(), have ? 1 : false)
 endforeach
 
+have_mempcpy = cc.has_function('mempcpy', prefix: '#include <string.h>', args: '-D_GNU_SOURCE')
+conf.set('HAVE_MEMPCPY', have_mempcpy ? 1 : false)
+
 have = conf.get('HAVE_FUTIMENS') in [1] and conf.get('HAVE_INOTIFY_INIT1') in [1]
 conf.set('AGETTY_RELOAD', have ? 1 : false)
 if not have
@@ -542,27 +695,41 @@ have_ddfd = cc.has_member('DIR', 'dd_fd',
 conf.set('HAVE_DECL_DDFD', have_ddfd ? 1 : false)
 
 have = cc.has_member('struct tm', 'tm_gmtoff',
+                     args : '-D_GNU_SOURCE',
                      prefix : '''
                      #include <time.h>
                      #include <unistd.h>
                      ''')
 conf.set('HAVE_TM_GMTOFF', have ? 1 : false)
 
+
+
+have = cc.has_type('enum fsconfig_command', prefix : '#include <linux/mount.h>')
+conf.set('HAVE_ENUM_FSCONFIG_COMMAND', have ? 1 : false)
+
 have = cc.has_member('struct termios', 'c_line',
                      prefix : '#include <termios.h>')
 conf.set('HAVE_STRUCT_TERMIOS_C_LINE', have ? 1 : false)
 
 have = cc.has_member('struct stat', 'st_mtim.tv_nsec',
+                     args : '-D_GNU_SOURCE',
                      prefix : '#include <sys/stat.h>')
 conf.set('HAVE_STRUCT_STAT_ST_MTIM_TV_NSEC', have ? 1 : false)
 
 # replacement for AC_STRUCT_TIMEZONE
 have = cc.has_member('struct tm', 'tm_zone',
+                     args : '-D_GNU_SOURCE',
                      prefix : '#include <time.h>')
 conf.set('HAVE_STRUCT_TM_TM_ZONE', have ? 1 : false)
 
-have = cc.sizeof('tzname', prefix : '#include <time.h>') > 0
+have = cc.has_header_symbol('time.h', 'tzname', args: '-D_GNU_SOURCE')
 conf.set('HAVE_DECL_TZNAME', have ? 1 : false)
+
+have = cc.has_header_symbol('linux/blkzoned.h', 'BLK_ZONE_REP_CAPACITY')
+conf.set('HAVE_DECL_BLK_ZONE_REP_CAPACITY', have ? 1 : false)
+
+have = cc.has_header_symbol('linux/pr.h', 'PR_REP_CAPACITY')
+conf.set('HAVE_DECL_PR_REP_CAPACITY', have ? 1 : false)
 
 code = '''
 #include <time.h>
@@ -573,9 +740,21 @@ int main(void) {
   return tzname ? 0 : 1;
 }
 '''.format(have ? 1 : 0)
-result = cc.run(code, name : 'using tzname[]')
-have = result.compiled() and result.returncode() == 0
+have = cc.compiles(code, name : 'using tzname[]')
 conf.set('HAVE_TZNAME', have ? 1 : false)
+
+have = cc.sizeof('time_t', prefix : '#include <time.h>')
+if have < 8
+  add_global_arguments('-D_TIME_BITS=64', language : 'c')
+  have = cc.sizeof('time_t', args : '-D_TIME_BITS=64', prefix : '#include <time.h>')
+  if have < 8
+    if get_option('allow-32bit-time')
+      warning('Could not make time_t 64bits wide')
+    else
+      error('Could not make time_t 64bits wide')
+    endif
+  endif
+endif
 
 socket_libs = []
 if not cc.has_function('socket')
@@ -587,22 +766,28 @@ if not cc.has_function('socket')
   endif
 endif
 
+lib_rt = cc.find_library('rt', required : false)
 realtime_libs = []
 have = cc.has_function('clock_gettime')
 if not have
-  realtime_libs += cc.find_library('rt', required : true)
-  have = cc.has_function('clock_gettime',
-                         dependencies : realtime_libs)
+  if lib_rt.found()
+    realtime_libs += lib_rt
+    have = cc.has_function('clock_gettime',
+                          dependencies : realtime_libs)
+  endif
 endif
-conf.set('HAVE_CLOCK_GETTIME', have_dirfd ? 1 : false)
+conf.set('HAVE_CLOCK_GETTIME', have ? 1 : false)
 
 thread_libs = dependency('threads')
+conf.set('HAVE_LIBPTHREAD', thread_libs.found() ? 1 : false)
 
 have = cc.has_function('timer_create')
 if not have
-  realtime_libs = cc.find_library('rt', required : true)
-  have = cc.has_function('timer_create',
-                         dependencies : realtime_libs)
+  if lib_rt.found()
+    realtime_libs = [lib_rt]
+    have = cc.has_function('timer_create',
+                           dependencies : realtime_libs)
+  endif
   if not have
     realtime_libs += thread_libs
     have = cc.has_function('timer_create',
@@ -619,7 +804,7 @@ rtas_libs = cc.find_library('rtas', required : false)
 conf.set('HAVE_LIBRTAS', rtas_libs.found() ? 1 : false)
 
 math_libs = []
-if not cc.has_function('isnan')
+if not cc.has_header_symbol('math.h', 'isnan')
   lib = cc.find_library('m', required : true)
   if (cc.has_function('isnan', dependencies : lib) and
       cc.has_function('__isnan', dependencies : lib))
@@ -637,9 +822,15 @@ int main(void) {
     return (*__progname != 0);
 }
 '''
-result = cc.run(code, name : 'using __progname')
-have = result.compiled() and result.returncode() == 0
+have = cc.compiles(code, name : 'using __progname')
 conf.set('HAVE___PROGNAME', have ? 1 : false)
+
+have_pty = conf.get('HAVE_PTY_H').to_string() == '1' \
+           and conf.get('HAVE_SYS_SIGNALFD_H').to_string() == '1'
+conf.set('HAVE_PTY', have_pty ? 1 : false)
+
+have_opal_get_status= cc.has_header_symbol('linux/sed-opal.h', 'IOC_OPAL_GET_STATUS')
+conf.set('HAVE_OPAL_GET_STATUS', have_opal_get_status ? 1 : false)
 
 build_plymouth_support = get_option('build-plymouth-support')
 have_tiocglcktrmios = cc.has_header_symbol(
@@ -655,8 +846,13 @@ have_sock_nonblock = cc.has_header_symbol(
   required : build_plymouth_support.enabled())
 have_so_passcred = cc.has_header_symbol(
   'sys/socket.h', 'SO_PASSCRED',
+  args : ['-D_GNU_SOURCE'],
   prefix : '#include <sys/types.h>',
   required : build_plymouth_support.enabled())
+
+have = cc.has_header_symbol('linux/vm_sockets.h', 'VMADDR_CID_LOCAL',
+                            prefix : '#include <sys/socket.h>')
+conf.set('HAVE_DECL_VMADDR_CID_LOCAL', have ? 1 : false)
 
 build_plymouth_support = (not build_plymouth_support.disabled() and 
                           have_tiocglcktrmios and
@@ -687,6 +883,7 @@ have = cc.links(code, name : 'fallocate() function')
 conf.set('HAVE_FALLOCATE', have ? 1 : false)
 
 code = '''
+#define _POSIX_C_SOURCE 200112L
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -705,6 +902,9 @@ conf.set('USE_HWCLOCK_CMOS', use_hwclock_cmos ? 1 : false)
 
 conf.set('HAVE_TLS', get_option('use-tls') ? 1 : false)
 conf.set('PG_BELL', get_option('pg-bell') ? 1 : false)
+conf.set('USE_COLORS_BY_DEFAULT', get_option('colors-default') ? 1 : false)
+
+is_glibc = cc.has_header_symbol('limits.h', '__GLIBC__')
 
 ############################################################
 
@@ -716,9 +916,25 @@ if fs_search_path_extra != ''
 endif
 conf.set_quoted('FS_SEARCH_PATH', fs_search_path)
 
+systemdsystemunitdir = ''
 if systemd.found()
-  systemdsystemunitdir = systemd.get_pkgconfig_variable('systemdsystemunitdir')
+  systemdsystemunitdir = systemd.get_variable(pkgconfig : 'systemdsystemunitdir')
 endif
+
+systemd_sysusers_dir = ''
+if systemd.found()
+  systemd_sysusers_dir = systemd.get_variable(pkgconfig : 'sysusers_dir')
+endif
+
+systemd_tmpfiles_dir = ''
+if systemd.found()
+  systemd_tmpfiles_dir = systemd.get_variable(pkgconfig : 'tmpfiles_dir')
+endif
+
+sysvinit = get_option('sysvinit').enabled()
+sysvinitrcdir = sysconfdir + '/init.d'
+
+program_tests = get_option('program-tests')
 
 chfn_chsh_password = get_option('chfn-chsh-password') or lib_user.found()
 conf.set('CHFN_CHSH_PASSWORD', chfn_chsh_password ? 1 : false)
@@ -729,25 +945,67 @@ conf.set('ONLY_LISTED_SHELLS', have ? 1 : false)
 have = get_option('use-tty-group')
 conf.set('USE_TTY_GROUP', have ? 1 : false)
 
+bison = find_program('bison')
+flex = find_program('flex')
+sed = find_program('sed')
+
 build_hwclock = not get_option('build-hwclock').disabled()
-bison = find_program('bison', required: build_hwclock)
 bison_gen = generator(
   bison,
   output : ['@BASENAME@.tab.c', '@BASENAME@.tab.h'],
   arguments : ['@INPUT@', '--defines=@OUTPUT1@', '--output=@OUTPUT0@'])
 
-
+python_program = find_program('python3', 'python', native : true)
 
 meson_make_symlink = meson.current_source_dir() + '/tools/meson-make-symlink.sh'
+meson_make_manpage_stub = meson.current_source_dir() + '/tools/meson-make-manpage-stub.sh'
 
-config_h = configure_file(
+configure_file(
   output : 'config.h',
   configuration : conf)
 
-add_project_arguments('-include', 'config.h', language : 'c')
+add_project_arguments('-include', meson.current_build_dir() / 'config.h', language : 'c')
+
+compiler_flags = [
+  '-fno-common',
+
+  '-Waddress-of-packed-member',
+  '-Wdiscarded-qualifiers',
+  '-Wembedded-directive',
+  '-Wextra-semi',
+  '-Wformat-security',
+  '-Wimplicit-function-declaration',
+  '-Wmissing-declarations',
+  '-Wmissing-parameter-type',
+  '-Wmissing-prototypes',
+  '-Wnested-externs',
+  '-Wno-missing-field-initializers',
+  '-Wold-style-definition',
+  '-Wpointer-arith',
+  '-Wredundant-decls',
+  '-Wsign-compare',
+  '-Wstrict-prototypes',
+  '-Wtype-limits',
+  '-Wuninitialized',
+  '-Wunused-but-set-parameter',
+  '-Wunused-but-set-variable',
+  '-Wunused-parameter',
+  '-Wunused-result',
+  '-Wunused-variable',
+  '-Wvla',
+  '-Walloca',
+]
+foreach compiler_flag : compiler_flags
+  if cc.has_argument(compiler_flag)
+    add_project_arguments(compiler_flag, language : 'c')
+  endif
+endforeach
 
 manadocs = []
-manlinks = []
+manlinks = {}
+
+bashcompletions = []
+bashcompletionslinks = {}
 
 subdir('include')
 subdir('lib')
@@ -755,21 +1013,23 @@ subdir('libblkid')
 subdir('libmount')
 subdir('libsmartcols')
 subdir('libuuid')
+subdir('liblastlog2')
 subdir('libfdisk')
+subdir('pam_lastlog2')
 subdir('login-utils')
 subdir('sys-utils')
 subdir('disk-utils')
 subdir('misc-utils')
 subdir('text-utils')
 subdir('term-utils')
+subdir('lsfd-cmd')
 subdir('po')
 
 includes = [dir_include,
-            dir_libblkid,
             dir_libsmartcols,
-            dir_libmount,
             dir_libfdisk,
             dir_libuuid,
+            dir_liblastlog2,
             dir_sys_utils]
 
 exes = []
@@ -780,37 +1040,37 @@ exe = executable(
   chfn_sources,
   chfn_chsh_sources,
   include_directories : includes,
-  link_with : lib_common,
+  link_with : [lib_common, logindefs_c],
   dependencies : chfn_chsh_deps,
   install_dir : usrbin_exec_dir,
+  install_mode : 'rwsr-xr-x',
   install : opt,
   build_by_default : opt)
+
 exe2 = executable(
   'chsh',
   'login-utils/chsh.c',
+  'lib/shells.c',
   chfn_chsh_sources,
   include_directories : includes,
   link_with : lib_common,
   dependencies : chfn_chsh_deps,
   install_dir : usrbin_exec_dir,
+  install_mode : 'rwsr-xr-x',
   install : opt,
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exes += [exe, exe2]
+  manadocs += ['login-utils/chfn.1.adoc', 'login-utils/chsh.1.adoc']
+  bashcompletions += ['chfn', 'chsh']
 endif
 
 exe = executable(
   'test_islocal',
   test_islocal_sources,
   include_directories : includes,
-  c_args : '-DTEST_PROGRAM')
-exes += exe
-
-exe = executable(
-  'test_logindefs',
-  test_logindefs_sources,
-  include_directories : includes,
-  c_args : '-DTEST_PROGRAM')
+  c_args : '-DTEST_PROGRAM',
+  build_by_default : program_tests)
 exes += exe
 
 exe = executable(
@@ -818,7 +1078,8 @@ exe = executable(
   test_consoles_sources,
   c_args : ['-DTEST_PROGRAM'],
   include_directories : includes,
-  link_with : lib_common)
+  link_with : lib_common,
+  build_by_default : program_tests)
 exes += exe
 
 opt = not get_option('build-last').disabled()
@@ -834,7 +1095,11 @@ if opt and not is_disabler(exe)
   exes += exe
   meson.add_install_script(meson_make_symlink,
                            'last',
-                           join_paths(usrbin_exec_dir, 'lastb'))
+                           usrbin_exec_dir / 'lastb')
+  manadocs += ['login-utils/last.1.adoc']
+  manlinks += {'lastb.1': 'last.1'}
+  bashcompletions += ['last']
+  bashcompletionslinks += {'lastb': 'last'}
 endif
 
 opt = not get_option('build-nologin').disabled()
@@ -848,6 +1113,7 @@ exe = executable(
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exes += exe
+  manadocs += ['login-utils/nologin.8.adoc']
 endif
 
 opt = not get_option('build-utmpdump').disabled()
@@ -861,28 +1127,32 @@ exe = executable(
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exes += exe
+  manadocs += ['login-utils/utmpdump.1.adoc']
+  bashcompletions += ['utmpdump']
 endif
 
-opt = not get_option('build-su').disabled()
+opt = get_option('build-su').require(have_pty).allowed()
 exe = executable(
   'su',
   'login-utils/su.c',
   'login-utils/su-common.c',
   'login-utils/su-common.h',
-  'login-utils/logindefs.c',
-  'login-utils/logindefs.h',
+  'lib/shells.c',
   pty_session_c,
   monotonic_c,
   include_directories : includes,
-  link_with : lib_common,
+  link_with : [lib_common, logindefs_c],
   dependencies : [lib_pam,
                   lib_pam_misc,
                   lib_util,
                   realtime_libs],
+  install_mode : 'rwsr-xr-x',
   install : opt,
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exes += exe
+  manadocs += ['login-utils/su.1.adoc']
+  bashcompletions += ['su']
 endif
 
 opt = not get_option('build-newgrp').disabled()
@@ -892,21 +1162,24 @@ exe = executable(
   include_directories : includes,
   dependencies : [lib_crypt],
   install_dir : usrbin_exec_dir,
+  install_mode : 'rwsr-xr-x',
   install : opt,
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exes += exe
+  manadocs += ['login-utils/newgrp.1.adoc']
+  bashcompletions += ['newgrp']
 endif
 
 opt = not get_option('build-lslogins').disabled()
 exe = executable(
   'lslogins',
   'login-utils/lslogins.c',
-  'login-utils/logindefs.c',
-  'login-utils/logindefs.h',
   include_directories : includes,
   link_with : [lib_common,
-               lib_smartcols],
+               lib_smartcols,
+               logindefs_c] +
+               (build_liblastlog2 ? [lib_lastlog2] : []),
   dependencies : [lib_selinux,
                   lib_systemd],
   install_dir : usrbin_exec_dir,
@@ -914,6 +1187,8 @@ exe = executable(
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exes += exe
+  manadocs += ['login-utils/lslogins.1.adoc']
+  bashcompletions += ['lslogins']
 endif
 
 opt = not get_option('build-vipw').disabled()
@@ -931,21 +1206,24 @@ if opt and not is_disabler(exe)
   exes += exe
   meson.add_install_script(meson_make_symlink,
                            'vipw',
-                           join_paths(usrbin_exec_dir, 'vigr'))
+                           usrbin_exec_dir / 'vigr')
+  manadocs += ['login-utils/vipw.8.adoc']
+  meson.add_install_script(meson_make_symlink,
+                           'vipw.8',
+                           mandir / 'man8/vigr.8')
 endif
 
-opt = not get_option('build-runuser').disabled()
+opt = get_option('build-runuser').require(have_pty).allowed()
 exe = executable(
   'runuser',
   'login-utils/runuser.c',
   'login-utils/su-common.c',
   'login-utils/su-common.h',
-  'login-utils/logindefs.c',
-  'login-utils/logindefs.h',
+  'lib/shells.c',
   pty_session_c,
   monotonic_c,
   include_directories : includes,
-  link_with : lib_common,
+  link_with : [lib_common, logindefs_c],
   dependencies : [lib_pam,
                   lib_pam_misc,
                   lib_util,
@@ -955,43 +1233,84 @@ exe = executable(
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exes += exe
+  manadocs += ['login-utils/runuser.1.adoc']
+  bashcompletionslinks += {'runuser': 'su'}
 endif
 
 ############################################################
 
+opt = not get_option('build-bits').disabled()
+exe = executable(
+  'bits',
+  bits_sources,
+  include_directories : includes,
+  link_with : lib_common,
+  install_dir : usrbin_exec_dir,
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['text-utils/bits.1.adoc']
+  bashcompletions += ['bits']
+endif
+
+opt = not get_option('build-col').require(is_glibc).disabled()
 exe = executable(
   'col',
   col_sources,
   include_directories : includes,
   link_with : lib_common,
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['text-utils/col.1.adoc']
+  bashcompletions += ['col']
+endif
 
+opt = not get_option('build-colcrt').disabled()
 exe = executable(
   'colcrt',
   colcrt_sources,
   include_directories : includes,
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['text-utils/colcrt.1.adoc']
+  bashcompletions += ['colcrt']
+endif
 
+opt = not get_option('build-colrm').disabled()
 exe = executable(
   'colrm',
   colrm_sources,
   include_directories : includes,
   link_with : lib_common,
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['text-utils/colrm.1.adoc']
+  bashcompletions += ['colrm']
+endif
 
+opt = not get_option('build-rev').disabled()
 exe = executable(
   'rev',
   rev_sources,
   include_directories : includes,
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['text-utils/rev.1.adoc']
+  bashcompletions += ['rev']
+endif
 
 exe = executable(
   'column',
@@ -1003,6 +1322,8 @@ exe = executable(
   install : true)
 if not is_disabler(exe)
   exes += exe
+  manadocs += ['text-utils/column.1.adoc']
+  bashcompletions += ['column']
 endif
 
 opt = not get_option('build-line').disabled()
@@ -1015,6 +1336,7 @@ exe = executable(
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exes += exe
+  manadocs += ['text-utils/line.1.adoc']
 endif
 
 opt = not get_option('build-pg').disabled()
@@ -1030,6 +1352,8 @@ exe = executable(
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exes += exe
+  manadocs += ['text-utils/pg.1.adoc']
+  bashcompletions += ['pg']
 endif
 
 opt = not get_option('build-ul').disabled()
@@ -1044,6 +1368,8 @@ exe = executable(
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exes += exe
+  manadocs += ['text-utils/ul.1.adoc']
+  bashcompletions += ['ul']
 endif
 
 opt = not get_option('build-more').disabled()
@@ -1066,23 +1392,29 @@ exe2 = executable(
   dependencies : [lib_tinfo,
                   curses_libs,
 		  lib_magic],
-  build_by_default : opt)
+  build_by_default : opt and program_tests)
 exes += exe
 if opt and not is_disabler(exe)
   exes += [exe, exe2]
+  manadocs += ['text-utils/more.1.adoc']
+  bashcompletions += ['more']
 endif
 
-exe = executable(
-  'hexdump',
-  hexdump_sources,
-  include_directories : includes,
-  link_with : [lib_common,
-               lib_tcolors],
-  install_dir : usrbin_exec_dir,
-  install : true)
+if not get_option('build-hexdump').disabled()
+  exe = executable(
+    'hexdump',
+    hexdump_sources,
+    include_directories : includes,
+    link_with : [lib_common,
+                 lib_tcolors],
+    install_dir : usrbin_exec_dir)
+else
+  exe = disabler()
+endif
 if not is_disabler(exe)
-  exes += exe
-  manadocs += ['text-utils/hexdump.1.adoc']
+    exes += exe
+    manadocs += ['text-utils/hexdump.1.adoc']
+    bashcompletions += ['hexdump']
 endif
 
 opt = not get_option('build-lsmem').disabled()
@@ -1098,6 +1430,7 @@ exe = executable(
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/lsmem.1.adoc']
+  bashcompletions += ['lsmem']
 endif
 
 opt = not get_option('build-chmem').disabled()
@@ -1112,39 +1445,57 @@ exe = executable(
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/chmem.8.adoc']
+  bashcompletions += ['chmem']
 endif
 
+opt = not get_option('build-choom').disabled()
 exe = executable(
   'choom',
   choom_sources,
   include_directories : includes,
   link_with : [lib_common],
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
-manadocs += ['sys-utils/choom.1.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['sys-utils/choom.1.adoc']
+  bashcompletions += ['choom']
+endif
 
+has_seminfo_type = cc.has_type('struct seminfo', args : '-D_GNU_SOURCE', prefix : '#include <sys/sem.h>')
+
+opt = get_option('build-ipcmk').require(has_seminfo_type).allowed()
 exe = executable(
   'ipcmk',
   ipcmk_sources,
   include_directories : includes,
   link_with : [lib_common],
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
-manadocs += ['sys-utils/ipcmk.1.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['sys-utils/ipcmk.1.adoc']
+  bashcompletions += ['ipcmk']
+endif
 
+opt = get_option('build-ipcrm').require(has_seminfo_type).allowed()
 exe = executable(
   'ipcrm',
   ipcrm_sources,
   include_directories : includes,
   link_with : [lib_common],
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
-manadocs += ['sys-utils/ipcrm.1.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['sys-utils/ipcrm.1.adoc']
+  bashcompletions += ['ipcrm']
+endif
 
-opt = not get_option('build-ipcs').disabled()
+opt = not get_option('build-ipcs').require(has_seminfo_type).disabled()
 exe = executable(
   'ipcs',
   ipcs_sources,
@@ -1156,6 +1507,7 @@ exe = executable(
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/ipcs.1.adoc']
+  bashcompletions += ['ipcs']
 endif
 
 opt = not get_option('build-rfkill').disabled()
@@ -1171,6 +1523,7 @@ exe = executable(
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/rfkill.8.adoc']
+  bashcompletions += ['rfkill']
 endif
 
 exe = executable(
@@ -1184,6 +1537,21 @@ exe = executable(
 if not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/renice.1.adoc']
+  bashcompletions += ['renice']
+endif
+
+exe = executable(
+  'setpgid',
+  setpgid_sources,
+  include_directories: includes,
+  link_with : [lib_common,
+               lib_smartcols],
+  install_dir : usrbin_exec_dir,
+  install : true)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['sys-utils/setpgid.1.adoc']
+  bashcompletions += ['setpgid']
 endif
 
 exe = executable(
@@ -1197,6 +1565,7 @@ exe = executable(
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/setsid.1.adoc']
+  bashcompletions += ['setsid']
 endif
 
 exe = executable(
@@ -1210,6 +1579,7 @@ exe = executable(
 if not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/readprofile.8.adoc']
+  bashcompletions += ['readprofile']
 endif
 
 opt = not get_option('build-tunelp').disabled()
@@ -1224,31 +1594,38 @@ exe = executable(
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/tunelp.8.adoc']
+  bashcompletions += ['tunelp']
 endif
 
+opt = get_option('build-fstrim').require(have_sys_vfs_header).allowed()
 exe = executable(
   'fstrim',
   fstrim_sources,
   include_directories : includes,
-  link_with : [lib_common,
-               lib_mount],
+  link_with : [lib_common],
+  dependencies : [mount_dep],
   install_dir : sbindir,
-  install : true)
-if not is_disabler(exe)
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/fstrim.8.adoc']
-endif  
+  bashcompletions += ['fstrim']
+endif
 
+opt = get_option('build-dmesg').require(cc.has_header('sys/klog.h')).allowed()
 exe = executable(
   'dmesg',
   dmesg_sources,
   include_directories : includes,
   link_with : [lib_common,
                lib_tcolors],
-  install : true)
-if not is_disabler(exe)
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/dmesg.1.adoc']
+  bashcompletions += ['dmesg']
 endif
 
 exe = executable(
@@ -1257,112 +1634,171 @@ exe = executable(
   include_directories : dir_include,
   c_args : '-DTEST_DMESG',
   link_with : [lib_common,
-               lib_tcolors])
+               lib_tcolors],
+  build_by_default : program_tests)
 if not is_disabler(exe)
   exes += exe
 endif
 
+opt = get_option('build-ctrlaltdel').allowed()
 exe = executable(
   'ctrlaltdel',
   ctrlaltdel_sources,
   include_directories : includes,
   link_with : [lib_common],
   install_dir : sbindir,
-  install : true)
-exes += exe
-manadocs += ['sys-utils/ctrlaltdel.8.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['sys-utils/ctrlaltdel.8.adoc']
+  bashcompletions += ['ctrlaltdel']
+endif
 
+have_linux_fs_h = conf.get('HAVE_LINUX_FS_H').to_string() == '1'
+
+opt = get_option('build-fsfreeze').require(have_linux_fs_h).allowed()
 exe = executable(
   'fsfreeze',
   fsfreeze_sources,
   include_directories : includes,
   install_dir : sbindir,
-  install : true)
-exes += exe
-manadocs += ['sys-utils/fsfreeze.8.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['sys-utils/fsfreeze.8.adoc']
+  bashcompletions += ['fsfreeze']
+endif
 
+opt = get_option('build-blkdiscard').require(have_linux_fs_h).allowed()
 exe = executable(
   'blkdiscard',
   blkdiscard_sources,
   include_directories : includes,
-  link_with : [lib_common,
-               lib_blkid],
+  link_with : [lib_common],
+  dependencies : [blkid_dep],
   install_dir : sbindir,
-  install : true)
-exes += exe
-manadocs += ['sys-utils/blkdiscard.8.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['sys-utils/blkdiscard.8.adoc']
+  bashcompletions += ['blkdiscard']
+endif
 
+opt = get_option('build-blkzone').require(have_linux_fs_h).allowed()
 exe = executable(
   'blkzone',
   blkzone_sources,
   include_directories : includes,
   link_with : [lib_common],
   install_dir : sbindir,
-  install : true)
-exes += exe
-manadocs += ['sys-utils/blkzone.8.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['sys-utils/blkzone.8.adoc']
+  bashcompletions += ['blkzone']
+endif
 
+opt = get_option('build-blkpr').require(cc.has_header('linux/pr.h')).allowed()
+exe = executable(
+  'blkpr',
+  blkpr_sources,
+  include_directories : includes,
+  link_with : [lib_common],
+  install_dir : sbindir,
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['sys-utils/blkpr.8.adoc']
+endif
+
+opt = get_option('build-ldattach').require(cc.has_header('linux/if.h')).allowed()
 exe = executable(
   'ldattach',
   ldattach_sources,
   include_directories : includes,
   link_with : [lib_common],
   install_dir : usrsbin_exec_dir,
-  install : true)
-exes += exe
-manadocs += ['sys-utils/ldattach.8.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['sys-utils/ldattach.8.adoc']
+  bashcompletions += ['ldattach']
+endif
 
+have_linux_rtc_h = cc.has_header('linux/rtc.h')
+
+opt = get_option('build-rtcwake').require(have_linux_rtc_h).allowed()
 exe = executable(
   'rtcwake',
   rtcwake_sources,
   include_directories : includes,
   link_with : [lib_common],
   install_dir : usrsbin_exec_dir,
-  install : true)
-exes += exe
-manadocs += ['sys-utils/rtcwake.8.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['sys-utils/rtcwake.8.adoc']
+  bashcompletions += ['rtcwake']
+endif
 
+opt = get_option('build-setarch').require(cc.has_header('sys/personality.h')).allowed()
 exe = executable(
   'setarch',
   setarch_sources,
   include_directories : includes,
+  link_with : [lib_common],
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
-manadocs += ['sys-utils/setarch.8.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['sys-utils/setarch.8.adoc']
+  bashcompletions += ['setarch']
+endif
 
-setarch_links = ['uname26', 'linux32', 'linux64']
-setarch_links_arch = {
-  's390x' :   ['s390', 's390x'],
-  'x86' :     ['i386'],
-  'x86_64' :  ['i386', 'x86_64'],
-  'ppc64' :   ['ppc', 'ppc64', 'ppc32'],
-  'space64' : ['sparc', 'sparc64', 'sparc32', 'sparc32bash'],
-  'mips64' :  ['mips', 'mips64', 'mips32'],
-  'ia64' :    ['i386', 'ia64'],
-  'hppa' :    ['parisc', 'parisc64', 'parisc32'],
-}
-setarch_links += setarch_links_arch.get(host_machine.cpu_family(), [])
+if opt
+  setarch_links = ['uname26', 'linux32', 'linux64']
+  setarch_links_arch = {
+    's390x' :   ['s390', 's390x'],
+    'x86' :     ['i386'],
+    'x86_64' :  ['i386', 'x86_64'],
+    'ppc64' :   ['ppc', 'ppc64', 'ppc32'],
+    'space64' : ['sparc', 'sparc64', 'sparc32', 'sparc32bash'],
+    'mips64' :  ['mips', 'mips64', 'mips32'],
+    'ia64' :    ['i386', 'ia64'],
+    'hppa' :    ['parisc', 'parisc64', 'parisc32'],
+  }
+  setarch_links += setarch_links_arch.get(host_machine.cpu_family(), [])
 
-foreach link: setarch_links
-  meson.add_install_script(meson_make_symlink,
-                           'setarch',
-                           join_paths(usrbin_exec_dir, link))
-endforeach
+  foreach link: setarch_links
+    meson.add_install_script(meson_make_symlink,
+                            'setarch',
+                            usrbin_exec_dir / link)
+    manlinks += {link + '.8': 'setarch.8'}
+  endforeach
+endif
 
 opt = not get_option('build-eject').disabled()
 exe = executable(
   'eject',
   eject_sources,
   include_directories : includes,
-  link_with : [lib_common,
-               lib_mount],
+  link_with : [lib_common],
+  dependencies : [mount_dep],
   install_dir : usrbin_exec_dir,
   install : opt,
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exe = exe
   manadocs += ['sys-utils/eject.1.adoc']
+  bashcompletions += ['eject']
 endif
 
 opt = not get_option('build-losetup').disabled()
@@ -1378,6 +1814,7 @@ exe = executable(
 if opt and not is_disabler(exe)
   manadocs += ['sys-utils/losetup.8.adoc']
   exes += exe
+  bashcompletions += ['losetup']
 endif
 
 opt = opt and 'losetup' in static_programs
@@ -1408,6 +1845,7 @@ exe = executable(
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/zramctl.8.adoc']
+  bashcompletions += ['zramctl']
 endif
 
 exe = executable(
@@ -1421,20 +1859,24 @@ exe = executable(
 if not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/prlimit.1.adoc']
+  bashcompletions += ['prlimit']
 endif
 
+opt = not get_option('build-lsns').disabled()
 exe = executable(
   'lsns',
   lsns_sources,
   include_directories : includes,
   link_with : [lib_common,
-               lib_smartcols,
-               lib_mount],
+               lib_smartcols],
+  dependencies : [mount_dep],
   install_dir : usrbin_exec_dir,
-  install : true)
-if not is_disabler(exe)
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/lsns.8.adoc']
+  bashcompletions += ['lsns']
 endif
 
 opt = not get_option('build-mount').disabled()
@@ -1443,17 +1885,18 @@ exe = executable(
   mount_sources,
   include_directories : includes,
   link_with : [lib_common,
-               lib_smartcols,
-               lib_mount],
-  dependencies : lib_selinux,
+               lib_smartcols],
+  dependencies : [lib_selinux, mount_dep],
+  install_mode : 'rwsr-xr-x',
   install : opt,
   build_by_default : opt)
 exe2 = executable(
   'umount',
   umount_sources,
   include_directories : includes,
-  link_with : [lib_common,
-               lib_mount],
+  link_with : [lib_common],
+  dependencies : [mount_dep],
+  install_mode : 'rwsr-xr-x',
   install : opt,
   build_by_default : opt)
 if opt and not is_disabler(exe)
@@ -1461,6 +1904,7 @@ if opt and not is_disabler(exe)
   manadocs += ['sys-utils/fstab.5.adoc',
 		    'sys-utils/mount.8.adoc',
 	            'sys-utils/umount.8.adoc']
+  bashcompletions += ['mount', 'umount']
 endif
 
 opt2 = opt and 'mount' in static_programs
@@ -1470,8 +1914,8 @@ exe = executable(
   include_directories : includes,
   link_args : ['--static'],
   link_with : [lib_common,
-               lib_smartcols_static,
-               lib_mount_static],
+               lib_smartcols_static],
+  dependencies : [mount_static_dep],
   install : opt2,
   build_by_default : opt2)
 if opt2 and not is_disabler(exe)
@@ -1484,8 +1928,8 @@ exe = executable(
   umount_sources,
   include_directories : includes,
   link_args : ['--static'],
-  link_with : [lib_common,
-               lib_mount_static],
+  link_with : [lib_common],
+  dependencies : [mount_static_dep],
   install : opt2,
   build_by_default : opt2)
 if opt2 and not is_disabler(exe)
@@ -1494,33 +1938,37 @@ endif
 
 # setuid?
 
+opt = not get_option('build-swapon').disabled()
 exe = executable(
   'swapon',
   swapon_sources,
   include_directories : includes,
   link_with : [lib_common,
-               lib_blkid,
-               lib_mount,
                lib_smartcols],
+  dependencies : [blkid_dep, mount_dep],
   install_dir : sbindir,
-  install : true)
-if not is_disabler(exe)
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/swapon.8.adoc']
+  bashcompletions += ['swapon']
 endif
 
+opt = not get_option('build-swapoff').disabled()
 exe = executable(
   'swapoff',
   swapoff_sources,
   include_directories : includes,
-  link_with : [lib_common,
-               lib_blkid,
-               lib_mount],
+  link_with : [lib_common],
+  dependencies : [blkid_dep, mount_dep],
   install_dir : sbindir,
-  install : true)
-if not is_disabler(exe)
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
   exes += exe
-  manlinks += 'sys-utils/swapoff.8.adoc'
+  manlinks += {'swapoff.8': 'swapon.8'}
+  bashcompletions += ['swapoff']
 endif
 
 exe = executable(
@@ -1535,17 +1983,23 @@ exe = executable(
 if not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/lscpu.1.adoc']
+  bashcompletions += ['lscpu']
 endif
 
+opt = get_option('build-chcpu').require(have_cpu_set_t).allowed()
 exe = executable(
   'chcpu',
   chcpu_sources,
   include_directories : includes,
   link_with : [lib_common],
   install_dir : sbindir,
-  install : true)
-exes += exe
-manadocs += ['sys-utils/chcpu.8.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['sys-utils/chcpu.8.adoc']
+  bashcompletions += ['chcpu']
+endif
 
 exe = executable(
   'wdctl',
@@ -1557,6 +2011,7 @@ exe = executable(
 if not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/wdctl.8.adoc']
+  bashcompletions += ['wdctl']
 endif
 
 opt = not get_option('build-mountpoint').disabled()
@@ -1564,12 +2019,13 @@ exe = executable(
   'mountpoint',
   mountpoint_sources,
   include_directories : includes,
-  link_with : [lib_mount],
+  dependencies : [mount_dep],
   install : opt,
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/mountpoint.1.adoc']
+  bashcompletions += ['mountpoint']
 endif
 
 opt = not get_option('build-fallocate').disabled()
@@ -1584,6 +2040,7 @@ exe = executable(
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/fallocate.1.adoc']
+  bashcompletions += ['fallocate']
 endif
 
 opt = not get_option('build-pivot_root').disabled()
@@ -1597,10 +2054,11 @@ exe = executable(
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/pivot_root.8.adoc']
+  bashcompletions += ['pivot_root']
 endif
 
 opt = not get_option('build-switch_root').disabled()
-if opt and  not have_dirfd and not have_ddfd
+if opt and not have_dirfd and not have_ddfd
   error('neither dirfd nor ddfd are available')
 endif
 exe = executable(
@@ -1621,12 +2079,14 @@ exe = executable(
   unshare_sources,
   include_directories : includes,
   link_with : [lib_common],
+  dependencies : [mount_dep],
   install_dir : usrbin_exec_dir,
   install : opt,
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/unshare.1.adoc']
+  bashcompletions += ['unshare']
 endif
 
 opt = opt and 'unshare' in static_programs
@@ -1635,6 +2095,7 @@ exe = executable(
   unshare_sources,
   include_directories : includes,
   link_with : [lib_common],
+  dependencies : [mount_dep],
   install_dir : usrbin_exec_dir,
   install : opt,
   build_by_default : opt)
@@ -1655,6 +2116,7 @@ exe = executable(
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/nsenter.1.adoc']
+  bashcompletions += ['nsenter']
 endif
 
 opt = opt and 'nsenter' in static_programs
@@ -1671,7 +2133,7 @@ if opt and not is_disabler(exe)
   exes += exe
 endif
 
-opt = not get_option('build-setpriv').disabled()
+opt = not get_option('build-setpriv').disabled() and lib_cap_ng.found()
 exe = executable(
   'setpriv',
   setpriv_sources,
@@ -1684,8 +2146,10 @@ exe = executable(
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/setpriv.1.adoc']
+  bashcompletions += ['setpriv']
 endif
 
+opt = not get_option('build-flock').disabled()
 exe = executable(
   'flock',
   flock_sources,
@@ -1693,9 +2157,13 @@ exe = executable(
   link_with : [lib_common],
   dependencies : realtime_libs,
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
-manadocs += ['sys-utils/flock.1.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['sys-utils/flock.1.adoc']
+  bashcompletions += ['flock']
+endif
 
 opt = not get_option('build-lsirq').disabled()
 exe = executable(
@@ -1710,6 +2178,7 @@ exe = executable(
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/lsirq.1.adoc']
+  bashcompletions += ['lsirq']
 endif
 
 opt = not get_option('build-irqtop').disabled()
@@ -1727,6 +2196,7 @@ exe = executable(
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/irqtop.1.adoc']
+  bashcompletions += ['irqtop']
 endif
 
 opt = not get_option('build-ipcs').disabled()
@@ -1742,6 +2212,7 @@ exe = executable(
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['sys-utils/lsipc.1.adoc']
+  bashcompletions += ['lsipc']
 endif
 
 opt = build_hwclock
@@ -1757,17 +2228,23 @@ exe = executable(
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exes += exe
-  manadocs += ['sys-utils/hwclock.8.adoc']
+  manadocs += ['sys-utils/hwclock.8.adoc', 'sys-utils/adjtime_config.5.adoc']
+  bashcompletions += ['hwclock']
 endif
 
+opt = not get_option('build-mkfs').disabled()
 exe = executable(
   'mkfs',
   mkfs_sources,
   include_directories : includes,
   install_dir : sbindir,
-  install : true)
-exes += exe
-manadocs += ['disk-utils/mkfs.8.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['disk-utils/mkfs.8.adoc']
+  bashcompletions += ['mkfs']
+endif
 
 opt = not get_option('build-bfs').disabled()
 exe = executable(
@@ -1781,31 +2258,37 @@ exe = executable(
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['disk-utils/mkfs.bfs.8.adoc']
+  bashcompletions += ['mkfs.bfs']
 endif
 
+opt = not get_option('build-isosize').disabled()
 exe = executable(
   'isosize',
   isosize_sources,
   include_directories : includes,
   link_with : [lib_common],
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
-manadocs += ['disk-utils/isosize.8.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['disk-utils/isosize.8.adoc']
+  bashcompletions += ['isosize']
+endif
 
 exe = executable(
   'mkswap',
   mkswap_sources,
   include_directories : includes,
   link_with : [lib_common,
-               lib_blkid,
                lib_uuid],
-  dependencies: [lib_selinux],
+  dependencies: [blkid_dep, lib_selinux],
   install_dir : sbindir,
   install : true)
-if opt and not is_disabler(exe)
+if not is_disabler(exe)
   exes += exe
   manadocs += ['disk-utils/mkswap.8.adoc']
+  bashcompletions += ['mkswap']
 endif
 
 exe = executable(
@@ -1813,13 +2296,14 @@ exe = executable(
   swaplabel_sources,
   include_directories : includes,
   link_with : [lib_common,
-               lib_blkid,
                lib_uuid],
+  dependencies : [blkid_dep],
   install_dir : sbindir,
   install : true)
-if opt and not is_disabler(exe)
+if not is_disabler(exe)
   exes += exe
   manadocs += ['disk-utils/swaplabel.8.adoc']
+  bashcompletions += ['swaplabel']
 endif
 
 opt = not get_option('build-fsck').disabled()
@@ -1827,16 +2311,15 @@ exe = executable(
   'fsck',
   fsck_sources,
   include_directories : includes,
-  link_with : [lib_common,
-               lib_blkid,
-               lib_mount],
-  dependencies : realtime_libs,
+  link_with : [lib_common],
+  dependencies : [blkid_dep, mount_dep, realtime_libs],
   install_dir : sbindir,
   install : opt,
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['disk-utils/fsck.8.adoc']
+  bashcompletions += ['fsck']
 endif
 
 opt = not get_option('build-minix').disabled()
@@ -1854,7 +2337,7 @@ exe2 = executable(
   include_directories : includes,
   c_args : '-DTEST_SCRIPT',
   link_with : [lib_common],
-  build_by_default : opt)
+  build_by_default : opt and program_tests)
 exe3 = executable(
   'fsck.minix',
   fsck_minix_sources,
@@ -1866,6 +2349,7 @@ exe3 = executable(
 if opt and not is_disabler(exe)
   exes += [exe, exe2, exe3]
   manadocs += ['disk-utils/mkfs.minix.8.adoc','disk-utils/fsck.minix.8.adoc']
+  bashcompletions += ['mkfs.minix', 'fsck.minix']
 endif
 
 opt = not get_option('build-cramfs').disabled()
@@ -1887,12 +2371,16 @@ exe2 = executable(
   install_dir : sbindir,
   install : opt,
   build_by_default : opt)
-if not is_disabler(exe)
+if opt and not is_disabler(exe)
   exes += [exe, exe2]
   manadocs += ['disk-utils/mkfs.cramfs.8.adoc','disk-utils/fsck.cramfs.8.adoc']
+  bashcompletions += ['mkfs.cramfs', 'fsck.cramfs']
 endif
 
 opt = not get_option('build-raw').disabled()
+if opt
+  cc.has_header('linux/raw.h', required: opt)
+endif
 exe = executable(
   'raw',
   raw_sources,
@@ -1903,6 +2391,7 @@ exe = executable(
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['disk-utils/raw.8.adoc']
+  bashcompletions += ['raw']
 endif
 
 opt = not get_option('build-fdformat').disabled()
@@ -1917,16 +2406,23 @@ exe = executable(
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['disk-utils/fdformat.8.adoc']
+  bashcompletions += ['fdformat']
 endif
 
+opt = get_option('build-blockdev').require(LINUX).allowed()
 exe = executable(
   'blockdev',
   blockdev_sources,
   include_directories : includes,
   link_with : [lib_common],
   install_dir : sbindir,
-  install : true)
-manadocs += ['disk-utils/blockdev.8.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['disk-utils/blockdev.8.adoc']
+  bashcompletions += ['blockdev']
+endif
 
 opt = not get_option('build-fdisks').disabled()
 if opt and not have_dirfd and not have_ddfd
@@ -1946,6 +2442,7 @@ exe = executable(
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exes += exe
+  bashcompletions += ['fdisk']
 endif
 
 opt2 = opt and 'fdisk' in static_programs
@@ -1980,6 +2477,7 @@ exe = executable(
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exes += exe
+  bashcompletions += ['sfdisk']
 endif
 
 opt2 = opt and 'sfdisk' in static_programs
@@ -2006,9 +2504,8 @@ exe = executable(
   link_with : [lib_common,
                lib_fdisk,
                lib_smartcols,
-               lib_tcolors,
-               lib_mount],
-  dependencies : [curses_libs],
+               lib_tcolors],
+  dependencies : [curses_libs, mount_dep],
   install_dir : sbindir,
   install : opt,
   build_by_default : opt)
@@ -2017,6 +2514,7 @@ if opt and not is_disabler(exe)
   manadocs += ['disk-utils/fdisk.8.adoc',
 		    'disk-utils/sfdisk.8.adoc',
 		    'disk-utils/cfdisk.8.adoc']
+  bashcompletions += ['cfdisk']
 endif
 
 opt = not get_option('build-partx').disabled()
@@ -2049,21 +2547,66 @@ exe4 = executable(
   partx_sources,
   include_directories : includes,
   link_with : [lib_common,
-               lib_blkid,
                lib_smartcols],
+  dependencies : [blkid_dep],
   install_dir : usrsbin_exec_dir,
   install : opt,
   build_by_default : opt)
-if opt
+if opt and not is_disabler(exe)
   exes += [exe, exe2, exe3, exe4]
   manadocs += ['disk-utils/addpart.8.adoc',
 		    'disk-utils/delpart.8.adoc',
 		    'disk-utils/resizepart.8.adoc',
 		    'disk-utils/partx.8.adoc']
+  bashcompletions += ['addpart', 'delpart', 'resizepart', 'partx']
+endif
+opt = opt and 'partx' in static_programs
+exe = executable(
+  'addpart.static',
+  addpart_sources,
+  include_directories : includes,
+  link_args : ['--static'],
+  link_with : [lib_common],
+  install_dir : usrsbin_exec_dir,
+  install : opt,
+  build_by_default : opt)
+exe2 = executable(
+  'delpart.static',
+  delpart_sources,
+  include_directories : includes,
+  link_args : ['--static'],
+  link_with : [lib_common],
+  install_dir : usrsbin_exec_dir,
+  install : opt,
+  build_by_default : opt)
+exe3 = executable(
+  'resizepart.static',
+  resizepart_sources,
+  include_directories : includes,
+  link_args : ['--static'],
+  link_with : [lib_common],
+  install_dir : usrsbin_exec_dir,
+  install : opt,
+  build_by_default : opt)
+exe4 = executable(
+  'partx.static',
+  partx_sources,
+  include_directories : includes,
+  link_args : ['--static'],
+  link_with : [lib_common,
+               lib_smartcols.get_static_lib()],
+  dependencies : [blkid_static_dep],
+  install_dir : usrsbin_exec_dir,
+  install : opt,
+  build_by_default : opt)
+
+if opt and not is_disabler(exe)
+  exes += [exe, exe2, exe3, exe4]
 endif
 
 ############################################################
 
+opt = get_option('build-script').require(have_pty).allowed()
 exe = executable(
   'script',
   script_sources,
@@ -2074,9 +2617,13 @@ exe = executable(
                   realtime_libs,
                   math_libs],
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
-manadocs += ['term-utils/script.1.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['term-utils/script.1.adoc']
+  bashcompletions += ['script']
+endif
 
 exe = executable(
   'test_script',
@@ -2087,9 +2634,13 @@ exe = executable(
   dependencies : [lib_util,
                   lib_utempter,
                   realtime_libs,
-                  math_libs])
-exes += exe
+                  math_libs],
+  build_by_default : opt and program_tests)
+if opt and not is_disabler(exe)
+  exes += exe
+endif
 
+opt = get_option('build-scriptutils').require(have_pty).allowed()
 exe = executable(
   'scriptlive',
   scriptlive_sources,
@@ -2099,9 +2650,13 @@ exe = executable(
                   realtime_libs,
                   math_libs],
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
-manadocs += ['term-utils/scriptlive.1.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['term-utils/scriptlive.1.adoc']
+  bashcompletions += ['scriptlive']
+endif
 
 exe = executable(
   'scriptreplay',
@@ -2110,21 +2665,25 @@ exe = executable(
   link_with : [lib_common],
   dependencies : [math_libs],
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
-manadocs += ['term-utils/scriptreplay.1.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['term-utils/scriptreplay.1.adoc']
+  bashcompletions += ['scriptreplay']
+endif
 
 opt = not get_option('build-agetty').disabled()
 exe = executable(
   'agetty',
   agetty_sources,
   include_directories : includes,
-  link_with : [lib_common],
-  dependencies : BSD ? lib_util : [],
+  link_with : [lib_common, logindefs_c],
+  dependencies : [BSD ? lib_util : [], lib_systemd],
   install_dir : sbindir,
   install : opt,
   build_by_default : opt)
-if opt
+if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['term-utils/agetty.8.adoc']
 endif
@@ -2139,9 +2698,10 @@ exe = executable(
   install_dir : usrbin_exec_dir,
   install : opt,
   build_by_default : opt)
-if opt
+if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['term-utils/setterm.1.adoc']
+  bashcompletions += ['setterm']
 endif
 
 opt = not get_option('build-mesg').disabled()
@@ -2153,9 +2713,17 @@ exe = executable(
   install_dir : usrbin_exec_dir,
   install : opt,
   build_by_default : opt)
-if opt
+if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['term-utils/mesg.1.adoc']
+  bashcompletions += ['mesg']
+endif
+
+tty_setgid = get_option('tty-setgid')
+if tty_setgid
+  tty_install_mode = [ 'rwxr-sr-x', 'root', 'tty' ]
+else
+  tty_install_mode = [ false, false, false ]
 endif
 
 opt = not get_option('build-wall').disabled()
@@ -2164,12 +2732,15 @@ exe = executable(
   wall_sources,
   include_directories : includes,
   link_with : [lib_common],
+  dependencies : [lib_systemd],
   install_dir : usrbin_exec_dir,
+  install_mode : tty_install_mode,
   install : opt,
   build_by_default : opt)
-if opt
+if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['term-utils/wall.1.adoc']
+  bashcompletions += ['wall']
 endif
 
 # chgrp tty $(DESTDIR)$(usrbin_execdir)/wall
@@ -2181,12 +2752,15 @@ exe = executable(
   write_sources,
   include_directories : includes,
   link_with : [lib_common],
+  dependencies : [lib_systemd],
   install_dir : usrbin_exec_dir,
+  install_mode : tty_install_mode,
   install : opt,
   build_by_default : opt)
-if opt
+if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['term-utils/write.1.adoc']
+  bashcompletions += ['write']
 endif
 
 # chgrp tty $(DESTDIR)$(usrbin_execdir)/write
@@ -2197,13 +2771,13 @@ exe = executable(
   'login',
   login_sources,
   include_directories : includes,
-  link_with : [lib_common],
+  link_with : [lib_common, logindefs_c],
   dependencies : [lib_pam,
                   lib_audit,
                   lib_selinux],
   install : opt,
   build_by_default : opt)
-if not is_disabler(exe)
+if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['login-utils/login.1.adoc']
 endif
@@ -2219,11 +2793,12 @@ exe = executable(
   install_dir : sbindir,
   install : opt,
   build_by_default : opt)
-if not is_disabler(exe)
+if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['login-utils/sulogin.8.adoc']
 endif
 
+opt = not get_option('build-cal').disabled()
 exe = executable(
   'cal',
   cal_sources,
@@ -2232,15 +2807,20 @@ exe = executable(
                lib_tcolors],
   dependencies : [curses_libs],
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
-manadocs += ['misc-utils/cal.1.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['misc-utils/cal.1.adoc']
+  bashcompletions += ['cal']
+endif
 
 opt = not get_option('build-logger').disabled()
 exe = executable(
   'logger',
   logger_sources,
   include_directories : includes,
+  link_with : [lib_common],
   dependencies : [lib_systemd],
   install_dir : usrbin_exec_dir,
   install : opt,
@@ -2248,6 +2828,7 @@ exe = executable(
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['misc-utils/logger.1.adoc']
+  bashcompletions += ['logger']
 endif
 
 exe = executable(
@@ -2255,88 +2836,165 @@ exe = executable(
   logger_sources,
   include_directories : includes,
   c_args : '-DTEST_LOGGER',
-  dependencies : [lib_systemd])
+  link_with : [lib_common],
+  dependencies : [lib_systemd],
+  build_by_default: program_tests)
 if not is_disabler(exe)
   exes += exe
 endif
 
+opt = not get_option('build-look').disabled()
 exe = executable(
   'look',
   look_sources,
   include_directories : includes,
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
-manadocs += ['misc-utils/look.1.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['misc-utils/look.1.adoc']
+  bashcompletions += ['look']
+endif
 
+opt = not get_option('build-mcookie').disabled()
 exe = executable(
   'mcookie',
   mcookie_sources,
   include_directories : includes,
   link_with : [lib_common],
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
-manadocs += ['misc-utils/mcookie.1.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['misc-utils/mcookie.1.adoc']
+  bashcompletions += ['mcookie']
+endif
 
+if build_liblastlog2
+  exe = executable(
+    'lastlog2',
+    lastlog2_sources,
+    include_directories : includes,
+    link_with : [lib_common, lib_lastlog2],
+    install_dir : usrbin_exec_dir,
+    install : true)
+  exes += exe
+  manadocs += ['misc-utils/lastlog2.8.adoc']
+  bashcompletions += ['lastlog2']
+  manadocs += ['liblastlog2/man/lastlog2.3.adoc',
+               'liblastlog2/man/ll2_write_entry.3.adoc',
+	       'liblastlog2/man/ll2_read_entry.3.adoc',
+	       'liblastlog2/man/ll2_import_lastlog.3.adoc',
+	       'liblastlog2/man/ll2_read_all.3.adoc',
+	       'liblastlog2/man/ll2_remove_entry.3.adoc',
+	       'liblastlog2/man/ll2_rename_user.3.adoc',
+	       'liblastlog2/man/ll2_update_login_time.3.adoc'
+	       ]
+endif
+
+opt = not get_option('build-namei').disabled()
 exe = executable(
   'namei',
   namei_sources,
   include_directories : includes,
+  dependencies : [lib_selinux],
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
-manadocs += ['misc-utils/namei.1.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['misc-utils/namei.1.adoc']
+  bashcompletions += ['namei']
+endif
 
+opt = not get_option('build-whereis').disabled()
 exe = executable(
   'whereis',
   whereis_sources,
   include_directories : includes,
   link_with : [lib_common],
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
-manadocs += ['misc-utils/whereis.1.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['misc-utils/whereis.1.adoc']
+  bashcompletions += ['whereis']
+endif
 
+opt = not get_option('build-lslocks').disabled()
 exe = executable(
   'lslocks',
   lslocks_sources,
   include_directories : includes,
   link_with : [lib_common,
-               lib_mount,
                lib_smartcols],
+  dependencies : [mount_dep],
   install_dir : usrbin_exec_dir,
-  install : true)
-if not is_disabler(exe)
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['misc-utils/lslocks.8.adoc']
+  bashcompletions += ['lslocks']
 endif
 
+opt = not get_option('build-lsblk').disabled()
 exe = executable(
   'lsblk',
   lsblk_sources,
   include_directories : includes,
   link_with : [lib_common,
-               lib_blkid,
-               lib_mount,
+               lib_tcolors,
                lib_smartcols],
-  dependencies : lib_udev,
-  install : true)
-if not is_disabler(exe)
+  dependencies : [blkid_dep, lib_udev, mount_dep],
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['misc-utils/lsblk.8.adoc']
+  bashcompletions += ['lsblk']
+endif
+
+errnos_h = custom_target('errnos.h',
+  input : 'tools/all_errnos',
+  output : 'errnos.h',
+  command : ['tools/all_errnos', sed.full_path(), '@OUTPUT@',
+             cc.cmd_array(), get_option('c_args')],
+)
+
+opt = not get_option('build-lsfd').require(lib_rt.found()).disabled() \
+      and cc.has_header_symbol('linux/bpf.h', 'BPF_OBJ_NAME_LEN') \
+      and cc.has_header_symbol('linux/bpf.h', 'BPF_TAG_SIZE')
+exe = executable(
+  'lsfd',
+  lsfd_sources, errnos_h,
+  include_directories : includes,
+  link_with : [lib_common,
+               lib_smartcols],
+  dependencies : [lib_rt],
+  install_dir : usrbin_exec_dir,
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['lsfd-cmd/lsfd.1.adoc']
 endif
 
 exe = executable(
   'uuidgen',
   uuidgen_sources,
   include_directories : includes,
-  link_with : [lib_uuid],
+  link_with : [lib_common,
+               lib_uuid],
   install_dir : usrbin_exec_dir,
   install : true)
 if not is_disabler(exe)
   exes += exe
   manadocs += ['misc-utils/uuidgen.1.adoc']
+  bashcompletions += ['uuidgen']
 endif
 
 exe = executable(
@@ -2351,6 +3009,7 @@ exe = executable(
 if not is_disabler(exe)
   exes += exe
   manadocs += ['misc-utils/uuidparse.1.adoc']
+  bashcompletions += ['uuidparse']
 endif
 
 opt = build_uuidd
@@ -2372,10 +3031,11 @@ exe2 = executable(
   link_with : [lib_common,
                lib_uuid],
   dependencies : thread_libs,
-  build_by_default : opt)
+  build_by_default : opt and program_tests)
 if not is_disabler(exe)
   exes += [exe, exe2]
   manadocs += ['misc-utils/uuidd.8.adoc']
+  bashcompletions += ['uuidd']
 endif
 
 opt = build_libblkid
@@ -2383,14 +3043,15 @@ exe = executable(
   'blkid',
   blkid_sources,
   include_directories : includes,
-  link_with : [lib_common,
-               lib_blkid],
+  link_with : [lib_common],
+  dependencies : [blkid_dep],
   install_dir : sbindir,
   install : opt,
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['misc-utils/blkid.8.adoc']
+  bashcompletions += ['blkid']
 endif
 
 opt = opt and 'blkid' in static_programs
@@ -2398,8 +3059,8 @@ exe = executable(
   'blkid.static',
   blkid_sources,
   include_directories : includes,
-  link_with : [lib_common,
-               lib_blkid_static],
+  link_with : [lib_common],
+  dependencies : [blkid_static_dep],
   install_dir : sbindir,
   install : opt,
   build_by_default : opt)
@@ -2411,7 +3072,7 @@ exe = executable(
   'sample-mkfs',
   'libblkid/samples/mkfs.c',
   include_directories : includes,
-  link_with : lib_blkid)
+  dependencies : [blkid_dep])
 if not is_disabler(exe)
   exes += exe
 endif
@@ -2420,7 +3081,7 @@ exe = executable(
   'sample-partitions',
   'libblkid/samples/partitions.c',
   include_directories : includes,
-  link_with : lib_blkid)
+  dependencies : [blkid_dep])
 if not is_disabler(exe)
   exes += exe
 endif
@@ -2429,7 +3090,7 @@ exe = executable(
   'sample-superblocks',
   'libblkid/samples/superblocks.c',
   include_directories : includes,
-  link_with : lib_blkid)
+  dependencies : [blkid_dep])
 if not is_disabler(exe)
   exes += exe
 endif
@@ -2438,23 +3099,36 @@ exe = executable(
   'sample-topology',
   'libblkid/samples/topology.c',
   include_directories : includes,
-  link_with : lib_blkid)
+  dependencies : [blkid_dep])
+if not is_disabler(exe)
+  exes += exe
+endif
+
+exe = executable(
+  'test_blkid_fuzz_sample',
+  'libblkid/src/fuzz.c',
+  include_directories: includes,
+  dependencies : [blkid_dep],
+  build_by_default: program_tests)
 if not is_disabler(exe)
   exes += exe
 endif
 
 ############################################################
 
+opt = not get_option('build-findfs').disabled()
 exe = executable(
   'findfs',
   findfs_sources,
   include_directories : includes,
-  link_with : [lib_blkid],
+  dependencies : [blkid_dep],
   install_dir : sbindir,
-  install : true)
-if not is_disabler(exe)
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['misc-utils/findfs.8.adoc']
+  bashcompletions += ['findfs']
 endif
 
 exe = executable(
@@ -2462,37 +3136,41 @@ exe = executable(
   wipefs_sources,
   include_directories : includes,
   link_with : [lib_common,
-               lib_blkid,
                lib_smartcols],
+  dependencies : [blkid_dep],
   install_dir : sbindir,
   install : true)
 if not is_disabler(exe)
   exes += exe
   manadocs += ['misc-utils/wipefs.8.adoc']
+  bashcompletions += ['wipefs']
 endif
 
+opt = not get_option('build-findmnt').disabled()
 exe = executable(
   'findmnt',
   findmnt_sources,
   include_directories : includes,
   link_with : [lib_common,
-               lib_blkid,
-               lib_mount,
                lib_smartcols],
-  dependencies : [lib_udev],
-  install : true)
-if not is_disabler(exe)
+  dependencies : [blkid_dep, lib_udev, mount_dep],
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['misc-utils/findmnt.8.adoc']
+  bashcompletions += ['findmnt']
 endif
 
+opt = not get_option('build-kill').disabled()
 exe = executable(
   'kill',
   kill_sources,
   include_directories : includes,
   link_with : [lib_common],
-  install : true)
-if not is_disabler(exe)
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['misc-utils/kill.1.adoc']
 endif
@@ -2502,23 +3180,30 @@ exe = executable(
   'rename',
   rename_sources,
   include_directories : includes,
+  link_with : [lib_common],
   install_dir : usrbin_exec_dir,
   install : opt,
   build_by_default : opt)
 if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['misc-utils/rename.1.adoc']
+  bashcompletions += ['rename']
 endif
 
+opt = not get_option('build-getopt').disabled()
 exe = executable(
   'getopt',
   getopt_sources,
   include_directories : includes,
   link_with : [lib_common],
   install_dir : usrbin_exec_dir,
-  install : true)
-exes += exe
-manadocs += ['misc-utils/getopt.1.adoc']
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['misc-utils/getopt.1.adoc']
+  bashcompletions += ['getopt']
+endif
 
 exe = executable(
   'fincore',
@@ -2531,19 +3216,37 @@ exe = executable(
 if not is_disabler(exe)
   exes += exe
   manadocs += ['misc-utils/fincore.1.adoc']
+  bashcompletions += ['fincore']
 endif
 
+opt = get_option('build-hardlink').allowed()
 exe = executable(
   'hardlink',
   hardlink_sources,
   include_directories : includes,
   link_with : [lib_common],
-  dependencies : [lib_pcre],
   install_dir : usrbin_exec_dir,
-  install : true)
-if not is_disabler(exe)
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
   exes += exe
   manadocs += ['misc-utils/hardlink.1.adoc']
+  bashcompletions += ['hardlink']
+endif
+
+opt = get_option('build-pipesz').allowed()
+exe = executable(
+  'pipesz',
+  pipesz_sources,
+  include_directories : includes,
+  link_with : [lib_common],
+  install_dir : usrbin_exec_dir,
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['misc-utils/pipesz.1.adoc']
+  bashcompletions += ['pipesz']
 endif
 
 exe = executable(
@@ -2553,9 +3256,97 @@ exe = executable(
   c_args : '-DTEST_CAL',
   link_with : [lib_common,
                lib_tcolors],
-  dependencies : [curses_libs])
+  dependencies : [curses_libs],
+  build_by_default: program_tests)
 if not is_disabler(exe)
   exes += exe
+endif
+
+have_posix_fadvise = conf.get('HAVE_POSIX_FADVISE').to_string() == '1'
+
+opt = get_option('build-fadvise').require(have_posix_fadvise).allowed()
+exe = executable(
+  'fadvise',
+  fadvise_sources,
+  include_directories : includes,
+  link_with : [lib_common],
+  install_dir : usrbin_exec_dir,
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['misc-utils/fadvise.1.adoc']
+  bashcompletions += ['fadvise']
+endif
+
+opt = get_option('build-waitpid').require(LINUX and conf.get('HAVE_PIDFD_OPEN').to_string() == '1').allowed()
+exe = executable(
+  'waitpid',
+  waitpid_sources,
+  include_directories : includes,
+  link_with : [lib_common],
+  install_dir : usrbin_exec_dir,
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['misc-utils/waitpid.1.adoc']
+  bashcompletions += ['waitpid']
+endif
+
+syscalls_h = custom_target('syscalls.h',
+  input : 'tools/all_syscalls',
+  output : 'syscalls.h',
+  command : ['tools/all_syscalls', sed.full_path(), '@OUTPUT@',
+             cc.cmd_array(), get_option('c_args')],
+)
+
+have_linux_audit_h = cc.has_header('linux/audit.h')
+have_audit_arch_native = cc.compiles(fs.read('include/audit-arch.h'), name : 'has AUDIT_ARCH_NATIVE')
+
+opt = get_option('build-enosys').require(have_linux_audit_h and have_audit_arch_native).allowed()
+exe = executable(
+  'enosys',
+  'misc-utils/enosys.c', syscalls_h, errnos_h,
+  include_directories : includes,
+  link_with : [lib_common],
+  install_dir : usrbin_exec_dir,
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['misc-utils/enosys.1.adoc']
+  bashcompletions += ['enosys']
+endif
+
+opt = get_option('build-lsclocks').require(have_linux_rtc_h).allowed()
+exe = executable(
+  'lsclocks',
+  lsclocks_sources,
+  include_directories : includes,
+  link_with : [lib_common, lib_smartcols],
+  install_dir : usrbin_exec_dir,
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['misc-utils/lsclocks.1.adoc']
+  bashcompletions += ['lsclocks']
+endif
+
+opt = get_option('build-exch').require(conf.get('HAVE_RENAMEAT2').to_string() == '1').allowed()
+exe = executable(
+  'exch',
+  exch_sources,
+  include_directories : includes,
+  link_with : [lib_common],
+  install_dir : usrbin_exec_dir,
+  install : opt,
+  build_by_default : opt)
+if opt and not is_disabler(exe)
+  exes += exe
+  manadocs += ['misc-utils/exch.1.adoc']
+  bashcompletions += ['exch']
 endif
 
 ############################################################
@@ -2597,12 +3388,23 @@ exe4 = executable(
   install : opt,
   build_by_default : opt)
 
+exe5 = executable(
+  'coresched',
+  'schedutils/coresched.c',
+  include_directories : includes,
+  link_with : lib_common,
+  install_dir : usrbin_exec_dir,
+  install : opt,
+  build_by_default : opt)
+
 if opt and not is_disabler(exe)
-  exes += [exe, exe2, exe3, exe4]
+  exes += [exe, exe2, exe3, exe4, exe5]
   manadocs += ['schedutils/chrt.1.adoc',
                'schedutils/ionice.1.adoc',
                'schedutils/taskset.1.adoc',
-	       'schedutils/uclampset.1.adoc']
+               'schedutils/uclampset.1.adoc',
+               'schedutils/coresched.1.adoc']
+  bashcompletions += ['chrt', 'ionice', 'taskset', 'uclampset', 'coresched']
 endif
 
 ############################################################
@@ -2614,38 +3416,53 @@ exe = executable(
   'lib/ttyutils.c',
   c_args : ['-DTEST_PROGRAM_TTYUTILS'],
   include_directories : dir_include,
-  link_with : lib_common)
-exes += exe
+  link_with : lib_common,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_blkdev',
   'lib/blkdev.c',
   c_args : ['-DTEST_PROGRAM_BLKDEV'],
   include_directories : dir_include,
-  link_with : lib_common)
-exes += exe
+  link_with : lib_common,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_ismounted',
   'lib/ismounted.c',
   c_args : ['-DTEST_PROGRAM_ISMOUNTED'],
   include_directories : dir_include,
-  link_with : lib_common)
-exes += exe
+  link_with : lib_common,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_mangle',
   'lib/mangle.c',
   c_args : ['-DTEST_PROGRAM_MANGLE'],
-  include_directories : dir_include)
-exes += exe
+  include_directories : dir_include,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_strutils',
   'lib/strutils.c',
   c_args : ['-DTEST_PROGRAM_STRUTILS'],
-  include_directories : dir_include)
-exes += exe
+  include_directories : dir_include,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_colors',
@@ -2653,109 +3470,165 @@ exe = executable(
   'lib/color-names.c',
   c_args : ['-DTEST_PROGRAM_COLORS'],
   include_directories : dir_include,
-  link_with : [lib_common, lib_tcolors])
-exes += exe
+  link_with : [lib_common, lib_tcolors],
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_randutils',
   'lib/randutils.c',
   c_args : ['-DTEST_PROGRAM_RANDUTILS'],
-  include_directories : dir_include)
-exes += exe
-
-# XXX: HAVE_OPENAT && HAVE_DIRFD
-exe = executable(
-  'test_procutils',
-  'lib/procutils.c',
-  c_args : ['-DTEST_PROGRAM_PROCUTILS'],
-  include_directories : dir_include)
-exes += exe
-
-# XXX: HAVE_OPENAT && HAVE_DIRFD
-exe = executable(
-  'test_path',
-  'lib/path.c',
-  'lib/fileutils.c',
-  have_cpu_set_t ? 'lib/cpuset.c' : [],
-  c_args : ['-DTEST_PROGRAM_PATH'],
   include_directories : dir_include,
-  link_with : lib_common)
-exes += exe
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
-# XXX: HAVE_PTY
-exe = executable(
-  'test_pty',
-  pty_session_c,
-  monotonic_c,
-  c_args : ['-DTEST_PROGRAM_PTY'],
-  include_directories : dir_include,
-  link_with : [lib_common],
-  dependencies : [lib_m,
-                  realtime_libs,
-                  lib_util])
-exes += exe
+if conf.get('HAVE_OPENAT').to_string() == '1' \
+   and conf.get('HAVE_DIRFD').to_string() == '1'
+  exe = executable(
+    'test_procfs',
+    'lib/procfs.c',
+    c_args : ['-DTEST_PROGRAM_PROCFS'],
+    include_directories : dir_include,
+    link_with : lib_common,
+    build_by_default: program_tests)
+  if not is_disabler(exe)
+    exes += exe
+  endif
 
-# XXX: LINUX
-exe = executable(
-  'test_cpuset',
-  'lib/cpuset.c',
-  c_args : ['-DTEST_PROGRAM_CPUSET'],
-  include_directories : dir_include)
-exes += exe
+  exe = executable(
+    'test_path',
+    'lib/path.c',
+    'lib/fileutils.c',
+    have_cpu_set_t ? 'lib/cpuset.c' : [],
+    c_args : ['-DTEST_PROGRAM_PATH'],
+    include_directories : dir_include,
+    link_with : lib_common,
+    build_by_default: program_tests)
+  if not is_disabler(exe)
+    exes += exe
+  endif
+endif
+
+if have_pty
+  exe = executable(
+    'test_pty',
+    pty_session_c,
+    monotonic_c,
+    c_args : ['-DTEST_PROGRAM_PTY'],
+    include_directories : dir_include,
+    link_with : [lib_common],
+    dependencies : [lib_m,
+                    realtime_libs,
+                    lib_util],
+    build_by_default: program_tests)
+  if not is_disabler(exe)
+    exes += exe
+  endif
+endif
+
+if LINUX
+  exe = executable(
+    'test_cpuset',
+    'lib/cpuset.c',
+    c_args : ['-DTEST_PROGRAM_CPUSET'],
+    include_directories : dir_include,
+    build_by_default: program_tests)
+  if not is_disabler(exe)
+    exes += exe
+  endif
+endif
 
 exe = executable(
   'test_sysfs',
   'lib/sysfs.c',
   'lib/path.c',
+  'lib/buffer.c',
+  'lib/mbsalign.c',
   'lib/fileutils.c',
   have_cpu_set_t ? 'lib/cpuset.c' : [],
   c_args : ['-DTEST_PROGRAM_SYSFS'],
-  include_directories : dir_include)
-exes += exe
+  include_directories : dir_include,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_pager',
   'lib/pager.c',
   c_args : ['-DTEST_PROGRAM_PAGER'],
-  include_directories : dir_include)
-exes += exe
+  include_directories : dir_include,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_linux_version',
   'lib/linux_version.c',
   c_args : ['-DTEST_PROGRAM_LINUXVERSION'],
-  include_directories : dir_include)
-exes += exe
+  include_directories : dir_include,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_fileutils',
   'lib/fileutils.c',
   c_args : ['-DTEST_PROGRAM_FILEUTILS'],
-  include_directories : dir_include)
-exes += exe
+  include_directories : dir_include,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_canonicalize',
   'lib/canonicalize.c',
   c_args : ['-DTEST_PROGRAM_CANONICALIZE'],
-  include_directories : dir_include)
-exes += exe
+  include_directories : dir_include,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_timeutils',
   'lib/timeutils.c',
   'lib/strutils.c',
   c_args : ['-DTEST_PROGRAM_TIMEUTILS'],
-  include_directories : dir_include)
-exes += exe
+  include_directories : dir_include,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_pwdutils',
   'lib/pwdutils.c',
   c_args : ['-DTEST_PROGRAM'],
   include_directories : dir_include,
-  link_with : lib_common)
-exes += exe
+  link_with : lib_common,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
+
+exe = executable(
+  'test_logindefs',
+  'lib/logindefs.c',
+  c_args : ['-DTEST_PROGRAM'],
+  include_directories : dir_include,
+  link_with : [lib_common, logindefs_c],
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 ############################################################
 
@@ -2764,23 +3637,37 @@ exe = executable(
   'libuuid/src/test_uuid.c',
   include_directories : [dir_include, dir_libuuid],
   link_with : lib_uuid,
-  dependencies : socket_libs)
+  dependencies : socket_libs,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
+
+exe = executable(
+  'test_uuid_time',
+  test_uuid_time_sources,
+  include_directories : [dir_include],
+  link_with : lib_uuid,
+  c_args : '-DTEST_PROGRAM',
+  build_by_default : program_tests)
 if not is_disabler(exe)
   exes += exe
 endif
 
 ############################################################
 
-libfdisk_tests_cflags = ['-DTEST_PROGRAM',
-                         '-Wno-unused']
-libfdisk_tests_ldadd = [lib_fdisk_static, lib_uuid, lib_blkid]
+libfdisk_tests_cflags = ['-DTEST_PROGRAM']
+libfdisk_tests_ldadd = [lib_fdisk_static, lib_uuid]
+libfdisk_tests_ldadd_deps = [blkid_dep]
 
 exe = executable(
   'test_fdisk_ask',
   'libfdisk/src/ask.c',
   c_args : libfdisk_tests_cflags,
   include_directories : lib_fdisk_includes,
-  link_with : libfdisk_tests_ldadd)
+  link_with : libfdisk_tests_ldadd,
+  dependencies : libfdisk_tests_ldadd_deps,
+  build_by_default: program_tests)
 if not is_disabler(exe)
   exes += exe
 endif
@@ -2790,7 +3677,9 @@ exe = executable(
   'libfdisk/src/gpt.c',
   c_args : libfdisk_tests_cflags,
   include_directories : lib_fdisk_includes,
-  link_with : libfdisk_tests_ldadd)
+  link_with : libfdisk_tests_ldadd,
+  dependencies : libfdisk_tests_ldadd_deps,
+  build_by_default: program_tests)
 if not is_disabler(exe)
   exes += exe
 endif
@@ -2800,7 +3689,9 @@ exe = executable(
   'libfdisk/src/utils.c',
   c_args : libfdisk_tests_cflags,
   include_directories : lib_fdisk_includes,
-  link_with : libfdisk_tests_ldadd)
+  link_with : libfdisk_tests_ldadd,
+  dependencies : libfdisk_tests_ldadd_deps,
+  build_by_default: program_tests)
 if not is_disabler(exe)
   exes += exe
 endif
@@ -2810,7 +3701,9 @@ exe = executable(
   'libfdisk/src/script.c',
   c_args : libfdisk_tests_cflags,
   include_directories : lib_fdisk_includes,
-  link_with : libfdisk_tests_ldadd)
+  link_with : libfdisk_tests_ldadd,
+  dependencies : libfdisk_tests_ldadd_deps,
+  build_by_default: program_tests)
 if not is_disabler(exe)
   exes += exe
 endif
@@ -2820,7 +3713,9 @@ exe = executable(
   'libfdisk/src/version.c',
   c_args : libfdisk_tests_cflags,
   include_directories : lib_fdisk_includes,
-  link_with : libfdisk_tests_ldadd)
+  link_with : libfdisk_tests_ldadd,
+  dependencies : libfdisk_tests_ldadd_deps,
+  build_by_default: program_tests)
 if not is_disabler(exe)
   exes += exe
 endif
@@ -2830,18 +3725,18 @@ exe = executable(
   'libfdisk/src/item.c',
   c_args : libfdisk_tests_cflags,
   include_directories : lib_fdisk_includes,
-  link_with : libfdisk_tests_ldadd)
+  link_with : libfdisk_tests_ldadd,
+  dependencies : libfdisk_tests_ldadd_deps,
+  build_by_default: program_tests)
 if not is_disabler(exe)
   exes += exe
 endif
 
-sample_fdisk_cflags = ['-Wno-unused']
 sample_fdisk_ldadd = [lib_common, lib_fdisk]
 
 exe = executable(
   'sample-fdisk-mkpart',
   'libfdisk/samples/mkpart.c',
-  c_args : sample_fdisk_cflags,
   include_directories : lib_fdisk_includes,
   link_with : sample_fdisk_ldadd)
 if not is_disabler(exe)
@@ -2851,7 +3746,6 @@ endif
 exe = executable(
   'sample-fdisk-mkpart-fullspec',
   'libfdisk/samples/mkpart-fullspec.c',
-  c_args : sample_fdisk_cflags,
   include_directories : lib_fdisk_includes,
   link_with : sample_fdisk_ldadd)
 if not is_disabler(exe)
@@ -2861,62 +3755,109 @@ endif
 ############################################################
 
 exe = executable(
+  'test_cap',
+  'tests/helpers/test_cap.c',
+  include_directories : includes,
+  dependencies : [lib_cap_ng],
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
+
+exe = executable(
   'test_mbsencode',
   'tests/helpers/test_mbsencode.c',
   include_directories : includes,
-  link_with : lib_common)
-exes += exe
+  link_with : lib_common,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_byteswap',
   'tests/helpers/test_byteswap.c',
-  include_directories : includes)
-exes += exe
+  include_directories : includes,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_md5',
   'tests/helpers/test_md5.c',
   md5_c,
-  include_directories : includes)
-exes += exe
+  include_directories : includes,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_sha1',
   'tests/helpers/test_sha1.c',
   sha1_c,
-  include_directories : includes)
-exes += exe
+  include_directories : includes,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_pathnames',
   'tests/helpers/test_pathnames.c',
-  include_directories : includes)
-exes += exe
+  include_directories : includes,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_strerror',
   'tests/helpers/test_strerror.c',
-  include_directories : includes)
-exes += exe
+  include_directories : includes,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_sysinfo',
   'tests/helpers/test_sysinfo.c',
-  include_directories : includes)
-exes += exe
+  include_directories : includes,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_sigreceive',
   'tests/helpers/test_sigreceive.c',
   include_directories : includes,
-  link_with : lib_common)
-exes += exe
+  link_with : lib_common,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
+
+exe = executable(
+  'test_sigstate',
+  'tests/helpers/test_sigstate.c',
+  include_directories : includes,
+  link_with : lib_common,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_tiocsti',
   'tests/helpers/test_tiocsti.c',
-  include_directories : includes)
-exes += exe
+  include_directories : includes,
+  build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
 
 exe = executable(
   'test_uuid_namespace',
@@ -2924,19 +3865,41 @@ exe = executable(
   predefined_c,
   unpack_c,
   unparse_c,
-  include_directories : includes)
+  include_directories : includes,
+  build_by_default: program_tests)
+exes += exe
+
+if LINUX and lib_rt.found()
+  exe = executable(
+    'test_mkfds',
+    'tests/helpers/test_mkfds.c',
+    'tests/helpers/test_mkfds.h',
+    'tests/helpers/test_mkfds_ppoll.c',
+    include_directories : includes,
+    dependencies : [lib_rt],
+    build_by_default: program_tests)
+  exes += exe
+endif
+
+exe = executable(
+  'test_enosys',
+  'tests/helpers/test_enosys.c',
+  include_directories : includes,
+  build_by_default: program_tests)
 exes += exe
 
 ############################################################
 
-# XXX: HAVE_OPENAT
-exe = executable(
-  'sample-scols-tree',
-  'libsmartcols/samples/tree.c',
-  include_directories : includes,
-  link_with : [lib_smartcols, lib_common])
-if not is_disabler(exe)
-  exes += exe
+if conf.get('HAVE_OPENAT').to_string() == '1'
+  exe = executable(
+    'sample-scols-tree',
+    'libsmartcols/samples/tree.c',
+    include_directories : includes,
+    link_with : [lib_smartcols, lib_common],
+    build_by_default: program_tests)
+  if not is_disabler(exe)
+    exes += exe
+  endif
 endif
 
 exe = executable(
@@ -2960,6 +3923,15 @@ endif
 exe = executable(
   'sample-scols-continuous',
   'libsmartcols/samples/continuous.c',
+  include_directories : includes,
+  link_with : [lib_smartcols, lib_common])
+if not is_disabler(exe)
+  exes += exe
+endif
+
+exe = executable(
+  'sample-scols-continuous-json',
+  'libsmartcols/samples/continuous-json.c',
   include_directories : includes,
   link_with : [lib_smartcols, lib_common])
 if not is_disabler(exe)
@@ -3002,6 +3974,25 @@ if not is_disabler(exe)
   exes += exe
 endif
 
+exe = executable(
+  'sample-mount-overwrite',
+  'libmount/samples/overwrite.c',
+  include_directories : includes,
+  dependencies : [mount_dep],
+  link_with : [lib_common])
+if not is_disabler(exe)
+  exes += exe
+endif
+
+exe = executable(
+  'test_boilerplate',
+  'Documentation/boilerplate.c',
+   include_directories : includes,
+   build_by_default: program_tests)
+if not is_disabler(exe)
+  exes += exe
+endif
+
 ############################################################
 
 # Let the test runner know whether we're running under asan and export
@@ -3013,7 +4004,7 @@ configure_file(output : 'meson.conf',
                           '''asan=@0@
 PYTHON=@1@
 '''.format(get_option('b_sanitize')=='address' ? 'yes' : '',
-           python.path())])
+           python_program.full_path())])
 
 run_sh = find_program('tests/run.sh')
 run_target(
@@ -3027,7 +4018,9 @@ run_target(
 
 
 manadocs += ['lib/terminal-colors.d.5.adoc']
-manadocs += ['libblkid/libblkid.3.adoc']
+if build_libblkid
+  manadocs += ['libblkid/libblkid.3.adoc']
+endif
 
 if build_libuuid
   manadocs += [
@@ -3040,19 +4033,20 @@ if build_libuuid
     'libuuid/man/uuid_parse.3.adoc',
     'libuuid/man/uuid_time.3.adoc',
     'libuuid/man/uuid_unparse.3.adoc']
-  manlinks += [
-    'libuuid/man/uuid_generate_random.3',
-    'libuuid/man/uuid_generate_time.3',
-    'libuuid/man/uuid_generate_time_safe.3']
+  manlinks += {
+    'uuid_generate_random.3': 'uuid_generate.3',
+    'uuid_generate_time.3': 'uuid_generate.3',
+    'uuid_generate_time_safe.3': 'uuid_generate.3',
+  }
 endif
 
-asciidoctor = find_program('asciidoctor')
+asciidoctor = find_program('asciidoctor', required : false)
 if asciidoctor.found()
   foreach adoc : manadocs
     name = adoc.split('/')[-1]
     page = name.split('.adoc')[0]
     section = page.split('.')[-1]
-    mandirn = join_paths(mandir, 'man' + section)
+    mandirn = mandir / 'man' + section
     input = adoc
 
     custom_target(
@@ -3060,13 +4054,40 @@ if asciidoctor.found()
       command : [ asciidoctor,
 	  '-b', 'manpage',
 	  '-a', 'VERSION=' + meson.project_version(),
+	  '-a', 'release-version=' + meson.project_version(),
 	  '-a', 'ADJTIME_PATH=/etc/adjtime',
+	  '-a', 'package-docdir=' + docdir,
 	  '--base-dir=' + meson.current_source_dir(),
           '--destination-dir=' + meson.current_build_dir(),
+          '--load-path', '@SOURCE_ROOT@/tools',
+          '--require', 'asciidoctor-includetracker',
 	  '@INPUT@'],
       input : input,
       output : [page],
+      depfile : page + '.deps',
       install: true,
       install_dir : mandirn)
+  endforeach
+
+  foreach link_name, target : manlinks
+    link_section = link_name.split('.')[-1]
+    target_section = target.split('.')[-1]
+    meson.add_install_script(meson_make_manpage_stub,
+      'man' + target_section / target,
+      mandir / 'man' + link_section / link_name)
+  endforeach
+endif
+
+if bash_completion.found()
+  foreach completion : bashcompletions
+    install_data(
+      'bash-completion' / completion,
+      install_dir : bash_completion.get_variable(pkgconfig : 'completionsdir')
+    )
+  endforeach
+  foreach link_name, target : bashcompletionslinks
+    meson.add_install_script(meson_make_symlink,
+      target,
+      bash_completion.get_variable(pkgconfig : 'completionsdir') / link_name)
   endforeach
 endif

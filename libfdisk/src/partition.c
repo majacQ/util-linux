@@ -40,6 +40,8 @@ static void init_partition(struct fdisk_partition *pa)
 struct fdisk_partition *fdisk_new_partition(void)
 {
 	struct fdisk_partition *pa = calloc(1, sizeof(*pa));
+	if (!pa)
+		return NULL;
 
 	pa->refcount = 1;
 	init_partition(pa);
@@ -259,8 +261,9 @@ int fdisk_partition_cmp_start(struct fdisk_partition *a,
  * @pa: partition
  * @enable: 0|1
  *
- * When @pa used as a template for fdisk_add_partition() when force label driver
- * to use the first possible space for the new partition.
+ * When @pa is used as a template for fdisk_add_partition(), it follows the driver's default for
+ * the beginning of the partition. For DOS, it is the first usable space, while for GPT, it is
+ * the first sector of the largest area.
  *
  * Returns: 0 on success, <0 on error.
  */
@@ -798,6 +801,14 @@ static int probe_partition_content(struct fdisk_context *cxt, struct fdisk_parti
 
 		DBG(PART, ul_debugobj(pa, "blkid prober: %p", pr));
 
+		blkid_probe_enable_superblocks(pr, 1);
+		blkid_probe_set_superblocks_flags(pr,
+				BLKID_SUBLKS_MAGIC |
+				BLKID_SUBLKS_TYPE |
+				BLKID_SUBLKS_LABEL |
+				BLKID_SUBLKS_UUID |
+				BLKID_SUBLKS_BADCSUM);
+
 		start = fdisk_partition_get_start(pa) * fdisk_get_sector_size(cxt);
 		size = fdisk_partition_get_size(pa) * fdisk_get_sector_size(cxt);
 
@@ -1041,7 +1052,7 @@ int fdisk_get_partition(struct fdisk_context *cxt, size_t partno,
 	return rc;
 }
 
-static struct fdisk_partition *resize_get_by_offset(
+static struct fdisk_partition *area_by_offset(
 			struct fdisk_table *tb,
 			struct fdisk_partition *cur,
 			fdisk_sector_t off)
@@ -1064,13 +1075,74 @@ static struct fdisk_partition *resize_get_by_offset(
 	return NULL;
 }
 
+static int resize_get_first_possible(
+			struct fdisk_table *tb,
+			struct fdisk_partition *cur,
+			fdisk_sector_t *start)
+{
+	struct fdisk_partition *pa = NULL, *first = NULL;
+	struct fdisk_iter itr;
+
+	fdisk_reset_iter(&itr, FDISK_ITER_FORWARD);
+
+	*start = 0;
+	DBG(TAB, ul_debugobj(tb, "checking first possible before start=%ju", (uintmax_t) cur->start));
+
+
+	while (fdisk_table_next_partition(tb, &itr, &pa) == 0) {
+
+		if (pa->start > cur->start || pa == cur)
+			break;
+
+		DBG(TAB, ul_debugobj(tb, " checking entry %p [partno=%zu start=%ju, end=%ju, size=%ju%s%s%s]",
+			pa,
+			fdisk_partition_get_partno(pa),
+			(uintmax_t) fdisk_partition_get_start(pa),
+			(uintmax_t) fdisk_partition_get_end(pa),
+			(uintmax_t) fdisk_partition_get_size(pa),
+			fdisk_partition_is_freespace(pa) ? " freespace" : "",
+			fdisk_partition_is_nested(pa)    ? " nested"    : "",
+			fdisk_partition_is_container(pa) ? " container" : ""));
+
+
+		if (!fdisk_partition_is_freespace(pa)) {
+			DBG(TAB, ul_debugobj(tb, "  ignored (no freespace)"));
+			first = NULL;
+			continue;
+		}
+		if (!fdisk_partition_has_start(pa) || !fdisk_partition_has_size(pa)) {
+			DBG(TAB, ul_debugobj(tb, "  ignored (no start/size)"));
+			first = NULL;
+			continue;
+		}
+		/* The current is nested, free space has to be nested within the same parent */
+		if (fdisk_partition_is_nested(cur)
+		    && pa->parent_partno != cur->parent_partno) {
+			DBG(TAB, ul_debugobj(tb, "  ignore (nested required)"));
+			first = NULL;
+			continue;
+		}
+		if (pa->start + pa->size <= cur->start) {
+			first = pa;
+			DBG(TAB, ul_debugobj(tb, "  entry usable"));
+		}
+	}
+
+	if (first)
+		*start = first->start;
+	else
+		DBG(PART, ul_debugobj(cur, "resize: nothing usable before %ju", (uintmax_t) cur->start));
+
+	return first ? 0 : -1;
+}
+
 /*
  * Verify that area addressed by @start is freespace or the @cur[rent]
  * partition and continue to the next table entries until it's freespace, and
  * counts size of all this space.
  *
  * This is core of the partition start offset move operation. We can move the
- * start within the current partition of to the another free space. It's
+ * start within the current partition to another free space. It's
  * forbidden to move start of the partition to another already defined
  * partition.
  */
@@ -1211,7 +1283,16 @@ static int recount_resize(
 		DBG(PART, ul_debugobj(tpl, "resize: moving start %s relative, new start: %ju",
 				tpl->movestart == FDISK_MOVE_DOWN  ? "DOWN" : "UP", (uintmax_t)start));
 
-	/* 1b) set new start - absolute number */
+	/* 1b) set new start - try freespace before the current partition */
+	} else if (tpl->movestart == FDISK_MOVE_DOWN) {
+
+		if (resize_get_first_possible(tb, cur, &start) != 0)
+			goto erange;
+
+		DBG(PART, ul_debugobj(tpl, "resize: moving start DOWN (first possible), new start: %ju",
+				(uintmax_t)start));
+
+	/* 1c) set new start - absolute number */
 	} else if (fdisk_partition_has_start(tpl)) {
 		start = fdisk_partition_get_start(tpl);
 		DBG(PART, ul_debugobj(tpl, "resize: moving start to absolute offset: %ju",
@@ -1220,7 +1301,7 @@ static int recount_resize(
 
 	/* 2) verify that start is within the current partition or any freespace area */
 	if (!FDISK_IS_UNDEF(start)) {
-		struct fdisk_partition *area = resize_get_by_offset(tb, cur, start);
+		struct fdisk_partition *area = area_by_offset(tb, cur, start);
 
 		if (area == cur)
 			DBG(PART, ul_debugobj(tpl, "resize: start points to the current partition"));
@@ -1326,7 +1407,8 @@ int fdisk_set_partition(struct fdisk_context *cxt, size_t partno,
 		return fdisk_add_partition(cxt, pa, NULL);
 	}
 
-	if (pa->resize || fdisk_partition_has_start(pa) || fdisk_partition_has_size(pa)) {
+	if (pa->resize || pa->movestart
+	    || fdisk_partition_has_start(pa) || fdisk_partition_has_size(pa)) {
 		xpa = __copy_partition(pa);
 		if (!xpa) {
 			rc = -ENOMEM;
@@ -1544,3 +1626,55 @@ int fdisk_is_partition_used(struct fdisk_context *cxt, size_t n)
 	return cxt->label->op->part_is_used(cxt, n);
 }
 
+
+/**
+ * fdisk_partition_max_size:
+ * @cxt: context
+ * @n: partition number (0 is the first partition)
+ * @maxsz: returns maximum size of partition
+ *
+ * Find maximum size the partition can be resized to.
+ * Takes into account free space between this partition and the next one.
+ *
+ * Returns: 0 on success, <0 on error.
+ */
+int fdisk_partition_get_max_size(struct fdisk_context *cxt, size_t n,
+				 fdisk_sector_t *maxsz)
+{
+	struct fdisk_partition *cur = NULL;
+	struct fdisk_table *tb = NULL;
+	int rc;
+
+	rc = fdisk_get_partitions(cxt, &tb);
+	if (rc)
+		goto out;
+
+	rc = fdisk_get_freespaces(cxt, &tb);
+	if (rc)
+		goto out;
+
+	rc = fdisk_table_sort_partitions(tb, fdisk_partition_cmp_start);
+	if (rc)
+		goto out;
+
+	cur = fdisk_table_get_partition_by_partno(tb, n);
+	if (!cur)
+		goto einval;
+
+	if (!fdisk_partition_has_start(cur))
+		goto einval;
+
+	if (resize_get_last_possible(tb, cur,
+				     fdisk_partition_get_start(cur), maxsz))
+		goto einval;
+
+out:
+	fdisk_unref_partition(cur);
+	fdisk_unref_table(tb);
+
+	return rc;
+
+einval:
+	rc = -EINVAL;
+	goto out;
+}

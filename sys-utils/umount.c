@@ -107,8 +107,8 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" -N, --namespace <ns>    perform umount in another namespace\n"), out);
 
 	fputs(USAGE_SEPARATOR, out);
-	printf(USAGE_HELP_OPTIONS(25));
-	printf(USAGE_MAN_TAIL("umount(8)"));
+	fprintf(out, USAGE_HELP_OPTIONS(25));
+	fprintf(out, USAGE_MAN_TAIL("umount(8)"));
 
 	exit(MNT_EX_SUCCESS);
 }
@@ -118,13 +118,8 @@ static void suid_drop(struct libmnt_context *cxt)
 	const uid_t ruid = getuid();
 	const uid_t euid = geteuid();
 
-	if (ruid != 0 && euid == 0) {
-		if (setgid(getgid()) < 0)
-			err(MNT_EX_FAIL, _("setgid() failed"));
-
-		if (setuid(getuid()) < 0)
-			err(MNT_EX_FAIL, _("setuid() failed"));
-	}
+	if (ruid != 0 && euid == 0 && drop_permissions() != 0)
+		err(MNT_EX_FAIL, _("drop permissions failed"));
 
 	/* be paranoid and check it, setuid(0) has to fail */
 	if (ruid != 0 && setuid(0) == 0)
@@ -134,7 +129,7 @@ static void suid_drop(struct libmnt_context *cxt)
 
 	/* restore "bad" environment variables */
 	if (envs_removed) {
-		env_list_setenv(envs_removed);
+		env_list_setenv(envs_removed, 0);
 		env_list_free(envs_removed);
 		envs_removed = NULL;
 	}
@@ -159,18 +154,27 @@ static void success_message(struct libmnt_context *cxt)
 		warnx(_("%s unmounted"), tgt);
 }
 
-static int mk_exit_code(struct libmnt_context *cxt, int rc)
+static int mk_exit_code(struct libmnt_context *cxt, int api_rc)
 {
 	char buf[BUFSIZ] = { 0 };
+	int rc;
 
-	rc = mnt_context_get_excode(cxt, rc, buf, sizeof(buf));
+	rc = mnt_context_get_excode(cxt, api_rc, buf, sizeof(buf));
 
 	/* suppress "not mounted" error message */
-	if (quiet &&
-	    rc == MNT_EX_FAIL &&
-	    mnt_context_syscall_called(cxt) &&
-	    mnt_context_get_syscall_errno(cxt) == EINVAL)
-		return rc;
+	if (quiet) {
+		switch (rc) {
+		case MNT_EX_USAGE:
+			if (api_rc == -EPERM)	/* non-root user */
+				return rc;
+			break;
+		case MNT_EX_FAIL:
+			if (mnt_context_syscall_called(cxt) &&
+			    mnt_context_get_syscall_errno(cxt) == EINVAL)
+				return rc;
+			break;
+		}
+	}
 
 	/* print errors/warnings */
 	if (*buf) {
@@ -351,7 +355,7 @@ static int umount_recursive(struct libmnt_context *cxt, const char *spec)
 	/* it's always real mountpoint, don't assume that the target maybe a device */
 	mnt_context_disable_swapmatch(cxt, 1);
 
-	fs = mnt_table_find_target(tb, spec, MNT_ITER_BACKWARD);
+	fs = mnt_table_find_target(tb, spec, MNT_ITER_FORWARD);
 	if (fs)
 		rc = umount_do_recurse(cxt, tb, fs);
 	else {
@@ -652,4 +656,3 @@ int main(int argc, char **argv)
 
 	return (rc < 256) ? rc : 255;
 }
-

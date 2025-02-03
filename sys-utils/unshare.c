@@ -20,10 +20,12 @@
 
 #include <errno.h>
 #include <getopt.h>
+#include <poll.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/eventfd.h>
 #include <sys/wait.h>
 #include <sys/mount.h>
 #include <sys/types.h>
@@ -39,6 +41,7 @@
 #include "caputils.h"
 #include "closestream.h"
 #include "namespace.h"
+#include "pidfd-utils.h"
 #include "exec_shell.h"
 #include "xalloc.h"
 #include "pathnames.h"
@@ -205,16 +208,16 @@ static ino_t get_mnt_ino(pid_t pid)
 	snprintf(path, sizeof(path), "/proc/%u/ns/mnt", (unsigned) pid);
 
 	if (stat(path, &st) != 0)
-		err(EXIT_FAILURE, _("cannot stat %s"), path);
+		err(EXIT_FAILURE, _("stat of %s failed"), path);
 	return st.st_ino;
 }
 
-static void settime(time_t offset, clockid_t clk_id)
+static void settime(int64_t offset, clockid_t clk_id)
 {
 	char buf[sizeof(stringify_value(ULONG_MAX)) * 3];
 	int fd, len;
 
-	len = snprintf(buf, sizeof(buf), "%d %ld 0", clk_id, offset);
+	len = snprintf(buf, sizeof(buf), "%d %" PRId64 " 0", clk_id, offset);
 
 	fd = open("/proc/self/timens_offsets", O_WRONLY);
 	if (fd < 0)
@@ -226,39 +229,98 @@ static void settime(time_t offset, clockid_t clk_id)
 	close(fd);
 }
 
-static void bind_ns_files_from_child(pid_t *child, int fds[2])
+/**
+ * waitchild() - Wait for a process to exit successfully
+ * @pid: PID of the process to wait for
+ *
+ * Wait for a process to exit successfully. If it exits with a non-zero return
+ * code, then exit() with the same status.
+ */
+static void waitchild(int pid)
 {
-	char ch;
-	pid_t ppid = getpid();
-	ino_t ino = get_mnt_ino(ppid);
+	int rc, status;
 
-	if (pipe(fds) < 0)
-		err(EXIT_FAILURE, _("pipe failed"));
+	do {
+		rc = waitpid(pid, &status, 0);
+		if (rc < 0) {
+			if (errno == EINTR)
+				continue;
+			err(EXIT_FAILURE, _("waitpid failed"));
+		}
+		if (WIFEXITED(status) &&
+		    WEXITSTATUS(status) != EXIT_SUCCESS)
+			exit(WEXITSTATUS(status));
+	} while (rc < 0);
+}
 
-	*child = fork();
+/**
+ * sync_with_child() - Tell our child we're ready and wait for it to exit
+ * @pid: The pid of our child
+ * @fd: A file descriptor created with eventfd()
+ *
+ * This tells a child created with fork_and_wait() that we are ready for it to
+ * continue. Once we have done that, wait for our child to exit.
+ */
+static void sync_with_child(pid_t pid, int fd)
+{
+	uint64_t ch = PIPE_SYNC_BYTE;
 
-	switch (*child) {
-	case -1:
+	write_all(fd, &ch, sizeof(ch));
+	close(fd);
+
+	waitchild(pid);
+}
+
+/**
+ * fork_and_wait() - Fork and wait to be sync'd with
+ * @fd - A file descriptor created with eventfd() which should be passed to
+ *       sync_with_child()
+ *
+ * This creates an eventfd and forks. The parent process returns immediately,
+ * but the child waits for a %PIPE_SYNC_BYTE on the eventfd before returning.
+ * This allows the parent to perform some tasks before the child starts its
+ * work. The parent should call sync_with_child() once it is ready for the
+ * child to continue.
+ *
+ * Return: The pid from fork()
+ */
+static pid_t fork_and_wait(int *fd)
+{
+	pid_t pid;
+	uint64_t ch;
+
+	*fd = eventfd(0, 0);
+	if (*fd < 0)
+		err(EXIT_FAILURE, _("eventfd failed"));
+
+	pid = fork();
+	if (pid < 0)
 		err(EXIT_FAILURE, _("fork failed"));
 
-	case 0:	/* child */
-		close(fds[1]);
-		fds[1] = -1;
-
-		/* wait for parent */
-		if (read_all(fds[0], &ch, 1) != 1 && ch != PIPE_SYNC_BYTE)
-			err(EXIT_FAILURE, _("failed to read pipe"));
-		if (get_mnt_ino(ppid) == ino)
-			exit(EXIT_FAILURE);
-		bind_ns_files(ppid);
-		exit(EXIT_SUCCESS);
-		break;
-
-	default: /* parent */
-		close(fds[0]);
-		fds[0] = -1;
-		break;
+	if (!pid) {
+		/* wait for the our parent to tell us to continue */
+		if (read_all(*fd, (char *)&ch, sizeof(ch)) != sizeof(ch) ||
+		    ch != PIPE_SYNC_BYTE)
+			err(EXIT_FAILURE, _("failed to read eventfd"));
+		close(*fd);
 	}
+
+	return pid;
+}
+
+static pid_t bind_ns_files_from_child(int *fd)
+{
+	pid_t child, ppid = getpid();
+	ino_t ino = get_mnt_ino(ppid);
+
+	child = fork_and_wait(fd);
+	if (child)
+		return child;
+
+	if (get_mnt_ino(ppid) == ino)
+		exit(EXIT_FAILURE);
+	bind_ns_files(ppid);
+	exit(EXIT_SUCCESS);
 }
 
 static uid_t get_user(const char *s, const char *err)
@@ -297,6 +359,407 @@ static gid_t get_group(const char *s, const char *err)
 	return ret;
 }
 
+/**
+ * struct map_range - A range of IDs to map
+ * @outer: First ID mapped on the outside of the namespace
+ * @inner: First ID mapped on the inside of the namespace
+ * @count: Length of the inside and outside ranges
+ * @next: Next range of IDs in the chain
+ *
+ * A range of uids/gids to map using new[gu]idmap.
+ */
+struct map_range {
+	unsigned int outer;
+	unsigned int inner;
+	unsigned int count;
+	struct map_range *next;
+};
+
+static void insert_map_range(struct map_range **chain, struct map_range map)
+{
+	struct map_range *tail = *chain;
+	*chain = xmalloc(sizeof(**chain));
+	memcpy(*chain, &map, sizeof(**chain));
+	(*chain)->next = tail;
+}
+
+/**
+ * get_map_range() - Parse a mapping range from a string
+ * @s: A string of the format inner:outer:count or outer,inner,count
+ *
+ * Parse a string of the form inner:outer:count or outer,inner,count into
+ * a new mapping range.
+ *
+ * Return: A struct map_range
+ */
+static struct map_range get_map_range(const char *s)
+{
+	int end;
+	struct map_range ret = { .next = NULL };
+
+	if (sscanf(s, "%u:%u:%u%n", &ret.inner, &ret.outer, &ret.count,
+		   &end) >= 3 && !s[end])
+		return ret; /* inner:outer:count */
+
+	if (sscanf(s, "%u,%u,%u%n", &ret.outer, &ret.inner, &ret.count,
+		   &end) >= 3 && !s[end])
+		return ret; /* outer,inner,count */
+
+	errx(EXIT_FAILURE, _("invalid mapping '%s'"), s);
+}
+
+/**
+ * read_subid_range() - Look up a user's sub[gu]id range
+ * @filename: The file to look up the range from. This should be either
+ *            ``/etc/subuid`` or ``/etc/subgid``.
+ * @uid: The uid of the user whose range we should look up.
+ * @identity: (boolean) If true identity map the range, otherwise map to 0
+ *
+ * This finds the first subid range matching @uid in @filename.
+ */
+static struct map_range read_subid_range(char *filename, uid_t uid, int identity)
+{
+	char *line = NULL, *pwbuf;
+	FILE *idmap;
+	size_t n = 0;
+	struct passwd *pw;
+	struct map_range map = { .inner = -1, .next = NULL };
+
+	pw = xgetpwuid(uid, &pwbuf);
+	if (!pw)
+		errx(EXIT_FAILURE, _("you (user %d) don't exist."), uid);
+
+	idmap = fopen(filename, "r");
+	if (!idmap)
+		err(EXIT_FAILURE, _("could not open '%s'"), filename);
+
+	/*
+	* Each line in sub[ug]idmap looks like
+	* username:subuid:count
+	* OR
+	* uid:subuid:count
+	*/
+	while (getline(&line, &n, idmap) != -1) {
+		char *rest, *s;
+
+		rest = strchr(line, ':');
+		if (!rest)
+			continue;
+		*rest = '\0';
+
+		if (strcmp(line, pw->pw_name) &&
+		    strtoul(line, NULL, 10) != pw->pw_uid)
+			continue;
+
+		s = rest + 1;
+		rest = strchr(s, ':');
+		if (!rest)
+			continue;
+		*rest = '\0';
+		map.outer = strtoul_or_err(s, _("failed to parse subid map"));
+
+		s = rest + 1;
+		rest = strchr(s, '\n');
+		if (rest)
+			*rest = '\0';
+		map.count = strtoul_or_err(s, _("failed to parse subid map"));
+
+		if (identity)
+			map.inner = map.outer;
+
+		fclose(idmap);
+		free(pw);
+		free(pwbuf);
+
+		return map;
+	}
+
+	errx(EXIT_FAILURE, _("no line matching user \"%s\" in %s"),
+	pw->pw_name, filename);
+}
+
+/**
+ * read_kernel_map() - Read all available IDs from the kernel
+ * @chain: destination list to receive pass-through ID mappings
+ * @filename: either /proc/self/uid_map or /proc/self/gid_map
+ *
+ * This is used by --map-users=all and --map-groups=all to construct
+ * pass-through mappings for all IDs available in the parent namespace.
+ */
+static void read_kernel_map(struct map_range **chain, char *filename)
+{
+	char *line = NULL;
+	size_t size = 0;
+	FILE *idmap;
+
+	idmap = fopen(filename, "r");
+	if (!idmap)
+		err(EXIT_FAILURE, _("could not open '%s'"), filename);
+
+	while (getline(&line, &size, idmap) != -1) {
+		unsigned int start, count;
+		if (sscanf(line, " %u %*u %u", &start, &count) < 2)
+			continue;
+		insert_map_range(chain, (struct map_range) {
+			.inner = start,
+			.outer = start,
+			.count = count
+		});
+	}
+
+	fclose(idmap);
+	free(line);
+}
+
+/**
+ * add_single_map_range() - Add a single-ID map into a list without overlap
+ * @chain: A linked list of ID range mappings
+ * @outer: ID outside the namespace for a single map.
+ * @inner: ID inside the namespace for a single map, or -1 for no map.
+ *
+ * Prepend a mapping to @chain for the single ID @outer to the single ID
+ * @inner. The tricky bit is that we cannot let existing mappings overlap it.
+ * We accomplish this by removing a "hole" from each existing range @map, if
+ * @outer or @inner overlap it. This may result in one less than @map->count
+ * IDs being mapped from @map. The unmapped IDs are always the topmost IDs
+ * of the mapping (either in the parent or the child namespace).
+ *
+ * Most of the time, this function will be called with a single mapping range
+ * @map, @map->outer as some large ID, @map->inner as 0, and @map->count as a
+ * large number (at least 1000, but less than @map->outer). Typically, there
+ * will be no conflict with @outer. However, @inner may split the mapping for
+ * e.g. --map-current-user.
+ */
+
+static void add_single_map_range(struct map_range **chain, unsigned int outer,
+				 unsigned int inner)
+{
+	struct map_range *map = *chain;
+
+	if (inner + 1 == 0)
+		outer = (unsigned int) -1;
+	*chain = NULL;
+
+	while (map) {
+		struct map_range lo = { 0 }, mid = { 0 }, hi = { 0 },
+				 *next = map->next;
+		unsigned int inner_offset, outer_offset;
+
+		/* Start inner IDs from zero for an auto mapping */
+		if (map->inner + 1 == 0)
+			map->inner = 0;
+
+		/*
+		 * If the single mapping exists and overlaps the range, remove
+		 * an ID
+		 */
+		if (inner + 1 != 0 &&
+		    ((outer >= map->outer && outer <= map->outer + map->count) ||
+		     (inner >= map->inner && inner <= map->inner + map->count)))
+			map->count--;
+
+		/* Determine where the splits between lo, mid, and hi will be */
+		outer_offset = min(outer > map->outer ? outer - map->outer : 0,
+				   map->count);
+		inner_offset = min(inner > map->inner ? inner - map->inner : 0,
+				   map->count);
+
+		/*
+		 * In the worst case, we need three mappings:
+		 * From the bottom of map to either inner or outer
+		 */
+		lo.outer = map->outer;
+		lo.inner = map->inner;
+		lo.count = min(inner_offset, outer_offset);
+
+		/* From the lower of inner or outer to the higher */
+		mid.outer = lo.outer + lo.count;
+		mid.outer += mid.outer == outer;
+		mid.inner = lo.inner + lo.count;
+		mid.inner += mid.inner == inner;
+		mid.count = abs_diff(outer_offset, inner_offset);
+
+		/* And from the higher of inner or outer to the end of the map */
+		hi.outer = mid.outer + mid.count;
+		hi.outer += hi.outer == outer;
+		hi.inner = mid.inner + mid.count;
+		hi.inner += hi.inner == inner;
+		hi.count = map->count - lo.count - mid.count;
+
+		/* Insert non-empty mappings into the output chain */
+		if (hi.count)
+			insert_map_range(chain, hi);
+		if (mid.count)
+			insert_map_range(chain, mid);
+		if (lo.count)
+			insert_map_range(chain, lo);
+
+		free(map);
+		map = next;
+	}
+
+	if (inner + 1 != 0) {
+		/* Insert single ID mapping as the first entry in the chain */
+		insert_map_range(chain, (struct map_range) {
+			.inner = inner,
+			.outer = outer,
+			.count = 1
+		});
+	}
+}
+
+/**
+ * map_ids_external() - Create a new uid/gid map using setuid helper
+ * @idmapper: Either newuidmap or newgidmap
+ * @ppid: Pid to set the map for
+ * @chain: A linked list of ID range mappings
+ *
+ * This creates a new uid/gid map for @ppid using @idmapper to set the
+ * mapping for each of the ranges in @chain.
+ *
+ * This function always exec()s or errors out and does not return.
+ */
+static void __attribute__((__noreturn__))
+map_ids_external(const char *idmapper, int ppid, struct map_range *chain)
+{
+	unsigned int i = 0, length = 3;
+	char **argv;
+
+	for (struct map_range *map = chain; map; map = map->next)
+		length += 3;
+	argv = xcalloc(length, sizeof(*argv));
+	argv[i++] = xstrdup(idmapper);
+	xasprintf(&argv[i++], "%u", ppid);
+
+	for (struct map_range *map = chain; map; map = map->next) {
+		xasprintf(&argv[i++], "%u", map->inner);
+		xasprintf(&argv[i++], "%u", map->outer);
+		xasprintf(&argv[i++], "%u", map->count);
+	}
+
+	argv[i] = NULL;
+	execvp(idmapper, argv);
+	errexec(idmapper);
+}
+
+/**
+ * map_ids_internal() - Create a new uid/gid map using root privilege
+ * @type: Either uid_map or gid_map
+ * @ppid: Pid to set the map for
+ * @chain: A linked list of ID range mappings
+ *
+ * This creates a new uid/gid map for @ppid using a privileged write to
+ * /proc/@ppid/@type to set a mapping for each of the ranges in @chain.
+ */
+static void map_ids_internal(const char *type, int ppid, struct map_range *chain)
+{
+	int count, fd;
+	unsigned int length = 0;
+	char buffer[4096], *path;
+
+	xasprintf(&path, "/proc/%u/%s", ppid, type);
+	for (struct map_range *map = chain; map; map = map->next) {
+		count = snprintf(buffer + length, sizeof(buffer) - length,
+				 "%u %u %u\n",
+				 map->inner, map->outer, map->count);
+		if (count < 0 || count + length > sizeof(buffer))
+			errx(EXIT_FAILURE,
+				_("%s too large for kernel 4k limit"), path);
+		length += count;
+	}
+
+	fd = open(path, O_WRONLY | O_CLOEXEC | O_NOCTTY);
+	if (fd < 0)
+		err(EXIT_FAILURE, _("failed to open %s"), path);
+	if (write_all(fd, buffer, length) < 0)
+		err(EXIT_FAILURE, _("failed to write %s"), path);
+	close(fd);
+	free(path);
+}
+
+/**
+ * map_ids_from_child() - Set up a new uid/gid map
+ * @fd: The eventfd to wait on
+ * @mapuser: The user to map the current user to (or -1)
+ * @usermap: The range of UIDs to map (or %NULL)
+ * @mapgroup: The group to map the current group to (or -1)
+ * @groupmap: The range of GIDs to map (or %NULL)
+ *
+ * fork_and_wait() for our parent to call sync_with_child() on @fd. Upon
+ * receiving the go-ahead, use newuidmap and newgidmap to set the uid/gid map
+ * for our parent's PID.
+ *
+ * Return: The pid of the child.
+ */
+static pid_t map_ids_from_child(int *fd, uid_t mapuser,
+				struct map_range *usermap, gid_t mapgroup,
+				struct map_range *groupmap)
+{
+	pid_t child, pid = 0;
+	pid_t ppid = getpid();
+
+	child = fork_and_wait(fd);
+	if (child)
+		return child;
+
+	if (usermap)
+		add_single_map_range(&usermap, geteuid(), mapuser);
+	if (groupmap)
+		add_single_map_range(&groupmap, getegid(), mapgroup);
+
+	if (geteuid() == 0) {
+		if (usermap)
+			map_ids_internal("uid_map", ppid, usermap);
+		if (groupmap)
+			map_ids_internal("gid_map", ppid, groupmap);
+		exit(EXIT_SUCCESS);
+	}
+
+	/* Avoid forking more than we need to */
+	if (usermap && groupmap) {
+		pid = fork();
+		if (pid < 0)
+			err(EXIT_FAILURE, _("fork failed"));
+		if (pid)
+			waitchild(pid);
+	}
+
+	if (!pid && usermap)
+		map_ids_external("newuidmap", ppid, usermap);
+	if (groupmap)
+		map_ids_external("newgidmap", ppid, groupmap);
+	exit(EXIT_SUCCESS);
+}
+
+static int is_fixed(const char *interp)
+{
+	const char *flags;
+
+	flags = strrchr(interp, ':');
+
+	return strchr(flags, 'F') != NULL;
+}
+
+static void load_interp(const char *binfmt_mnt, const char *interp)
+{
+	int dirfd, fd;
+
+	dirfd = open(binfmt_mnt, O_PATH | O_DIRECTORY);
+	if (dirfd < 0)
+		err(EXIT_FAILURE, _("cannot open %s"), binfmt_mnt);
+
+	fd = openat(dirfd, "register", O_WRONLY);
+	if (fd < 0)
+		err(EXIT_FAILURE, _("cannot open %s/register"), binfmt_mnt);
+
+	if (write_all(fd, interp, strlen(interp)))
+		err(EXIT_FAILURE, _("write failed %s/register"), binfmt_mnt);
+
+	close(fd);
+
+	close(dirfd);
+}
+
 static void __attribute__((__noreturn__)) usage(void)
 {
 	FILE *out = stdout;
@@ -323,10 +786,16 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" --map-group=<gid>|<name>  map current group to gid (implies --user)\n"), out);
 	fputs(_(" -r, --map-root-user       map current user to root (implies --user)\n"), out);
 	fputs(_(" -c, --map-current-user    map current user to itself (implies --user)\n"), out);
+	fputs(_(" --map-auto                map users and groups automatically (implies --user)\n"), out);
+	fputs(_(" --map-users=<inneruid>:<outeruid>:<count>\n"
+		"                           map count users from outeruid to inneruid (implies --user)\n"), out);
+	fputs(_(" --map-groups=<innergid>:<outergid>:<count>\n"
+		"                           map count groups from outergid to innergid (implies --user)\n"), out);
 	fputs(USAGE_SEPARATOR, out);
 	fputs(_(" --kill-child[=<signame>]  when dying, kill the forked child (implies --fork)\n"
 		"                             defaults to SIGKILL\n"), out);
 	fputs(_(" --mount-proc[=<dir>]      mount proc filesystem first (implies --mount)\n"), out);
+	fputs(_(" --mount-binfmt[=<dir>]    mount binfmt filesystem first (implies --user and --mount)\n"), out);
 	fputs(_(" --propagation slave|shared|private|unchanged\n"
 	        "                           modify mount propagation in mount namespace\n"), out);
 	fputs(_(" --setgroups allow|deny    control the setgroups syscall in user namespaces\n"), out);
@@ -338,10 +807,11 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" -G, --setgid <gid>        set gid in entered namespace\n"), out);
 	fputs(_(" --monotonic <offset>      set clock monotonic offset (seconds) in time namespaces\n"), out);
 	fputs(_(" --boottime <offset>       set clock boottime offset (seconds) in time namespaces\n"), out);
+	fputs(_(" -l, --load-interp <file>  load binfmt definition in the namespace (implies --mount-binfmt)\n"), out);
 
 	fputs(USAGE_SEPARATOR, out);
-	printf(USAGE_HELP_OPTIONS(27));
-	printf(USAGE_MAN_TAIL("unshare(1)"));
+	fprintf(out, USAGE_HELP_OPTIONS(27));
+	fprintf(out, USAGE_MAN_TAIL("unshare(1)"));
 
 	exit(EXIT_SUCCESS);
 }
@@ -350,6 +820,7 @@ int main(int argc, char *argv[])
 {
 	enum {
 		OPT_MOUNTPROC = CHAR_MAX + 1,
+		OPT_MOUNTBINFMT,
 		OPT_PROPAGATION,
 		OPT_SETGROUPS,
 		OPT_KILLCHILD,
@@ -357,7 +828,11 @@ int main(int argc, char *argv[])
 		OPT_MONOTONIC,
 		OPT_BOOTTIME,
 		OPT_MAPUSER,
+		OPT_MAPUSERS,
 		OPT_MAPGROUP,
+		OPT_MAPGROUPS,
+		OPT_MAPAUTO,
+		OPT_MAPSUBIDS,
 	};
 	static const struct option longopts[] = {
 		{ "help",          no_argument,       NULL, 'h'             },
@@ -375,10 +850,15 @@ int main(int argc, char *argv[])
 		{ "fork",          no_argument,       NULL, 'f'             },
 		{ "kill-child",    optional_argument, NULL, OPT_KILLCHILD   },
 		{ "mount-proc",    optional_argument, NULL, OPT_MOUNTPROC   },
+		{ "mount-binfmt",  optional_argument, NULL, OPT_MOUNTBINFMT },
 		{ "map-user",      required_argument, NULL, OPT_MAPUSER     },
+		{ "map-users",     required_argument, NULL, OPT_MAPUSERS    },
 		{ "map-group",     required_argument, NULL, OPT_MAPGROUP    },
+		{ "map-groups",    required_argument, NULL, OPT_MAPGROUPS   },
 		{ "map-root-user", no_argument,       NULL, 'r'             },
 		{ "map-current-user", no_argument,    NULL, 'c'             },
+		{ "map-auto",      no_argument,       NULL, OPT_MAPAUTO     },
+		{ "map-subids",    no_argument,       NULL, OPT_MAPSUBIDS   },
 		{ "propagation",   required_argument, NULL, OPT_PROPAGATION },
 		{ "setgroups",     required_argument, NULL, OPT_SETGROUPS   },
 		{ "keep-caps",     no_argument,       NULL, OPT_KEEPCAPS    },
@@ -388,6 +868,7 @@ int main(int argc, char *argv[])
 		{ "wd",		   required_argument, NULL, 'w'		    },
 		{ "monotonic",     required_argument, NULL, OPT_MONOTONIC   },
 		{ "boottime",      required_argument, NULL, OPT_BOOTTIME    },
+		{ "load-interp",   required_argument, NULL, 'l'		    },
 		{ NULL, 0, NULL, 0 }
 	};
 
@@ -396,21 +877,29 @@ int main(int argc, char *argv[])
 	int c, forkit = 0;
 	uid_t mapuser = -1;
 	gid_t mapgroup = -1;
+	struct map_range *usermap = NULL;
+	struct map_range *groupmap = NULL;
 	int kill_child_signo = 0; /* 0 means --kill-child was not used */
 	const char *procmnt = NULL;
+	const char *binfmt_mnt = NULL;
 	const char *newroot = NULL;
 	const char *newdir = NULL;
-	pid_t pid_bind = 0;
+	pid_t pid_bind = 0, pid_idmap = 0;
+	const char *newinterp = NULL;
 	pid_t pid = 0;
-	int fds[2];
+#ifdef UL_HAVE_PIDFD
+	int fd_parent_pid = -1;
+#endif
+	int fd_idmap, fd_bind = -1;
+	sigset_t sigset, oldsigset;
 	int status;
 	unsigned long propagation = UNSHARE_PROPAGATION_DEFAULT;
 	int force_uid = 0, force_gid = 0;
 	uid_t uid = 0, real_euid = geteuid();
 	gid_t gid = 0, real_egid = getegid();
 	int keepcaps = 0;
-	time_t monotonic = 0;
-	time_t boottime = 0;
+	int64_t monotonic = 0;
+	int64_t boottime = 0;
 	int force_monotonic = 0;
 	int force_boottime = 0;
 
@@ -419,7 +908,7 @@ int main(int argc, char *argv[])
 	textdomain(PACKAGE);
 	close_stdout_atexit();
 
-	while ((c = getopt_long(argc, argv, "+fhVmuinpCTUrR:w:S:G:c", longopts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "+fhVmuinpCTUrR:w:S:G:cl:", longopts, NULL)) != -1) {
 		switch (c) {
 		case 'f':
 			forkit = 1;
@@ -468,6 +957,15 @@ int main(int argc, char *argv[])
 			unshare_flags |= CLONE_NEWNS;
 			procmnt = optarg ? optarg : "/proc";
 			break;
+		case OPT_MOUNTBINFMT:
+			unshare_flags |= CLONE_NEWNS | CLONE_NEWUSER;
+			binfmt_mnt = optarg;
+			if (!binfmt_mnt) {
+				if (!procmnt)
+					procmnt = "/proc";
+				binfmt_mnt = _PATH_PROC_BINFMT_MISC;
+			}
+			break;
 		case OPT_MAPUSER:
 			unshare_flags |= CLONE_NEWUSER;
 			mapuser = get_user(optarg, _("failed to parse uid"));
@@ -485,6 +983,42 @@ int main(int argc, char *argv[])
 			unshare_flags |= CLONE_NEWUSER;
 			mapuser = real_euid;
 			mapgroup = real_egid;
+			break;
+		case OPT_MAPUSERS:
+			unshare_flags |= CLONE_NEWUSER;
+			if (!strcmp(optarg, "auto"))
+				insert_map_range(&usermap,
+						 read_subid_range(_PATH_SUBUID, real_euid, 0));
+			else if (!strcmp(optarg, "subids"))
+				insert_map_range(&usermap,
+						 read_subid_range(_PATH_SUBUID, real_euid, 1));
+			else if (!strcmp(optarg, "all"))
+				read_kernel_map(&usermap, _PATH_PROC_UIDMAP);
+			else
+				insert_map_range(&usermap, get_map_range(optarg));
+			break;
+		case OPT_MAPGROUPS:
+			unshare_flags |= CLONE_NEWUSER;
+			if (!strcmp(optarg, "auto"))
+				insert_map_range(&groupmap,
+						 read_subid_range(_PATH_SUBGID, real_euid, 0));
+			else if (!strcmp(optarg, "subids"))
+				insert_map_range(&usermap,
+						 read_subid_range(_PATH_SUBGID, real_euid, 1));
+			else if (!strcmp(optarg, "all"))
+				read_kernel_map(&groupmap, _PATH_PROC_GIDMAP);
+			else
+				insert_map_range(&groupmap, get_map_range(optarg));
+			break;
+		case OPT_MAPAUTO:
+			unshare_flags |= CLONE_NEWUSER;
+			insert_map_range(&usermap, read_subid_range(_PATH_SUBUID, real_euid, 0));
+			insert_map_range(&groupmap, read_subid_range(_PATH_SUBGID, real_euid, 0));
+			break;
+		case OPT_MAPSUBIDS:
+			unshare_flags |= CLONE_NEWUSER;
+			insert_map_range(&usermap, read_subid_range(_PATH_SUBUID, real_euid, 1));
+			insert_map_range(&groupmap, read_subid_range(_PATH_SUBGID, real_euid, 1));
 			break;
 		case OPT_SETGROUPS:
 			setgrpcmd = setgroups_str2id(optarg);
@@ -521,12 +1055,21 @@ int main(int argc, char *argv[])
 			newdir = optarg;
 			break;
                 case OPT_MONOTONIC:
-			monotonic = strtoul_or_err(optarg, _("failed to parse monotonic offset"));
+			monotonic = strtos64_or_err(optarg, _("failed to parse monotonic offset"));
 			force_monotonic = 1;
 			break;
                 case OPT_BOOTTIME:
-			boottime = strtoul_or_err(optarg, _("failed to parse boottime offset"));
+			boottime = strtos64_or_err(optarg, _("failed to parse boottime offset"));
 			force_boottime = 1;
+			break;
+		case 'l':
+			unshare_flags |= CLONE_NEWNS | CLONE_NEWUSER;
+			if (!binfmt_mnt) {
+				if (!procmnt)
+					procmnt = "/proc";
+				binfmt_mnt = _PATH_PROC_BINFMT_MISC;
+			}
+			newinterp = optarg;
 			break;
 
 		case 'h':
@@ -540,13 +1083,24 @@ int main(int argc, char *argv[])
 
 	if ((force_monotonic || force_boottime) && !(unshare_flags & CLONE_NEWTIME))
 		errx(EXIT_FAILURE, _("options --monotonic and --boottime require "
-			"unsharing of a time namespace (-t)"));
+			"unsharing of a time namespace (-T)"));
+
+	/* clear any inherited settings */
+	signal(SIGCHLD, SIG_DFL);
 
 	if (npersists && (unshare_flags & CLONE_NEWNS))
-		bind_ns_files_from_child(&pid_bind, fds);
+		pid_bind = bind_ns_files_from_child(&fd_bind);
+
+	if (usermap || groupmap)
+		pid_idmap = map_ids_from_child(&fd_idmap, mapuser, usermap,
+					       mapgroup, groupmap);
 
 	if (-1 == unshare(unshare_flags))
 		err(EXIT_FAILURE, _("unshare failed"));
+
+	/* Tell child we've called unshare() */
+	if (usermap || groupmap)
+		sync_with_child(pid_idmap, fd_idmap);
 
 	if (force_boottime)
 		settime(boottime, CLOCK_BOOTTIME);
@@ -555,19 +1109,32 @@ int main(int argc, char *argv[])
 		settime(monotonic, CLOCK_MONOTONIC);
 
 	if (forkit) {
-		signal(SIGINT, SIG_IGN);
-		signal(SIGTERM, SIG_IGN);
-
-		/* force child forking before mountspace binding
-		 * so pid_for_children is populated */
+		if (sigemptyset(&sigset) != 0 ||
+			sigaddset(&sigset, SIGINT) != 0 ||
+			sigaddset(&sigset, SIGTERM) != 0 ||
+			sigprocmask(SIG_BLOCK, &sigset, &oldsigset) != 0)
+			err(EXIT_FAILURE, _("sigprocmask block failed"));
+#ifdef UL_HAVE_PIDFD
+		if (kill_child_signo != 0) {
+			/* make a connection to the original process (parent) */
+			fd_parent_pid = pidfd_open(getpid(), 0);
+			if (0 > fd_parent_pid)
+				err(EXIT_FAILURE, _("pidfd_open failed"));
+		}
+#endif
+		/* force child forking before mountspace binding so
+		 * pid_for_children is populated */
 		pid = fork();
 
 		switch(pid) {
 		case -1:
 			err(EXIT_FAILURE, _("fork failed"));
 		case 0:	/* child */
-			if (pid_bind && (unshare_flags & CLONE_NEWNS))
-				close(fds[1]);
+			if (sigprocmask(SIG_SETMASK, &oldsigset, NULL))
+				err(EXIT_FAILURE,
+					_("sigprocmask restore failed"));
+			if (npersists && (unshare_flags & CLONE_NEWNS))
+				close(fd_bind);
 			break;
 		default: /* parent */
 			break;
@@ -576,28 +1143,9 @@ int main(int argc, char *argv[])
 
 	if (npersists && (pid || !forkit)) {
 		/* run in parent */
-		if (pid_bind && (unshare_flags & CLONE_NEWNS)) {
-			int rc;
-			char ch = PIPE_SYNC_BYTE;
-
-			/* signal child we are ready */
-			write_all(fds[1], &ch, 1);
-			close(fds[1]);
-			fds[1] = -1;
-
-			/* wait for bind_ns_files_from_child() */
-			do {
-				rc = waitpid(pid_bind, &status, 0);
-				if (rc < 0) {
-					if (errno == EINTR)
-						continue;
-					err(EXIT_FAILURE, _("waitpid failed"));
-				}
-				if (WIFEXITED(status) &&
-				    WEXITSTATUS(status) != EXIT_SUCCESS)
-					return WEXITSTATUS(status);
-			} while (rc < 0);
-		} else
+		if (pid_bind && (unshare_flags & CLONE_NEWNS))
+			sync_with_child(pid_bind, fd_bind);
+		else
 			/* simple way, just bind */
 			bind_ns_files(getpid());
 	}
@@ -606,27 +1154,64 @@ int main(int argc, char *argv[])
 		if (waitpid(pid, &status, 0) == -1)
 			err(EXIT_FAILURE, _("waitpid failed"));
 
-		signal(SIGINT, SIG_DFL);
-		signal(SIGTERM, SIG_DFL);
-
 		if (WIFEXITED(status))
 			return WEXITSTATUS(status);
-		if (WIFSIGNALED(status))
-			kill(getpid(), WTERMSIG(status));
+		if (WIFSIGNALED(status)) {
+
+			/* Ensure the signal that terminated the child will
+			 * also terminate the parent. */
+
+			int termsig = WTERMSIG(status);
+
+			if (termsig != SIGKILL && signal(termsig, SIG_DFL) == SIG_ERR)
+				err(EXIT_FAILURE,
+					_("signal handler reset failed"));
+			if (sigemptyset(&sigset) != 0 ||
+				sigaddset(&sigset, termsig) != 0 ||
+				sigprocmask(SIG_UNBLOCK, &sigset, NULL) != 0)
+				err(EXIT_FAILURE,
+					_("sigprocmask unblock failed"));
+
+			kill(getpid(), termsig);
+		}
 		err(EXIT_FAILURE, _("child exit failed"));
 	}
 
-	if (kill_child_signo != 0 && prctl(PR_SET_PDEATHSIG, kill_child_signo) < 0)
-		err(EXIT_FAILURE, "prctl failed");
+	if (kill_child_signo != 0) {
+		if (prctl(PR_SET_PDEATHSIG, kill_child_signo) < 0)
+			err(EXIT_FAILURE, "prctl failed");
+#ifdef UL_HAVE_PIDFD
+		/* Use poll() to check that there is still the original parent. */
+		if (fd_parent_pid != -1) {
+			struct pollfd pollfds[1] = {
+				{ .fd = fd_parent_pid, .events = POLLIN	}
+			};
+			int nfds = poll(pollfds, 1, 0);
 
-        if (mapuser != (uid_t) -1)
+			if (0 > nfds)
+				err(EXIT_FAILURE, "poll parent pidfd failed");
+
+			/* If the child was re-parented before prctl(2) was called, the
+			 * new parent will likely not be interested in the precise exit
+			 * status of the orphan.
+			 */
+			if (nfds)
+				exit(EXIT_FAILURE);
+
+			close(fd_parent_pid);
+			fd_parent_pid = -1;
+		}
+#endif
+	}
+
+        if (mapuser != (uid_t) -1 && !usermap)
 		map_id(_PATH_PROC_UIDMAP, mapuser, real_euid);
 
         /* Since Linux 3.19 unprivileged writing of /proc/self/gid_map
          * has been disabled unless /proc/self/setgroups is written
          * first to permanently disable the ability to call setgroups
          * in that user namespace. */
-	if (mapgroup != (gid_t) -1) {
+	if (mapgroup != (gid_t) -1 && !groupmap) {
 		if (setgrpcmd == SETGROUPS_ALLOW)
 			errx(EXIT_FAILURE, _("options --setgroups=allow and "
 					"--map-group are mutually exclusive"));
@@ -640,6 +1225,13 @@ int main(int argc, char *argv[])
 	if ((unshare_flags & CLONE_NEWNS) && propagation)
 		set_propagation(propagation);
 
+	if (newinterp && is_fixed(newinterp) && newroot) {
+		if (mount("binfmt_misc", _PATH_PROC_BINFMT_MISC, "binfmt_misc",
+			  MS_NOSUID|MS_NOEXEC|MS_NODEV, NULL) != 0)
+			err(EXIT_FAILURE, _("mount %s failed"), _PATH_PROC_BINFMT_MISC);
+		load_interp(_PATH_PROC_BINFMT_MISC, newinterp);
+	}
+
 	if (newroot) {
 		if (chroot(newroot) != 0)
 			err(EXIT_FAILURE,
@@ -650,11 +1242,29 @@ int main(int argc, char *argv[])
 		err(EXIT_FAILURE, _("cannot chdir to '%s'"), newdir);
 
 	if (procmnt) {
-		if (!newroot && mount("none", procmnt, NULL, MS_PRIVATE|MS_REC, NULL) != 0)
-			err(EXIT_FAILURE, _("cannot change %s filesystem propagation"), procmnt);
+		/* When not changing root and using the default propagation flags
+		   then the recursive propagation change of root will
+		   automatically change that of an existing proc mount. */
+		if (!newroot && propagation != (MS_PRIVATE|MS_REC)) {
+			int rc = mount("none", procmnt, NULL, MS_PRIVATE|MS_REC, NULL);
+
+			/* Custom procmnt means that proc is very likely not mounted, causing EINVAL.
+			   Ignoring the error in this specific instance is considered safe. */
+			if(rc != 0 && errno != EINVAL)
+				err(EXIT_FAILURE, _("cannot change %s filesystem propagation"), procmnt);
+		}
+
 		if (mount("proc", procmnt, "proc", MS_NOSUID|MS_NOEXEC|MS_NODEV, NULL) != 0)
 			err(EXIT_FAILURE, _("mount %s failed"), procmnt);
 	}
+
+	if (binfmt_mnt) {
+		if (mount("binfmt_misc", binfmt_mnt, "binfmt_misc",
+			  MS_NOSUID|MS_NOEXEC|MS_NODEV, NULL) != 0)
+			err(EXIT_FAILURE, _("mount %s failed"), binfmt_mnt);
+	}
+	if (newinterp && !(is_fixed(newinterp) && newroot))
+		load_interp(binfmt_mnt, newinterp);
 
 	if (force_gid) {
 		if (setgroups(0, NULL) != 0)	/* drop supplementary groups */
@@ -665,42 +1275,8 @@ int main(int argc, char *argv[])
 	if (force_uid && setuid(uid) < 0)	/* change UID */
 		err(EXIT_FAILURE, _("setuid failed"));
 
-	/* We use capabilities system calls to propagate the permitted
-	 * capabilities into the ambient set because we have already
-	 * forked so are in async-signal-safe context. */
-	if (keepcaps && (unshare_flags & CLONE_NEWUSER)) {
-		struct __user_cap_header_struct header = {
-			.version = _LINUX_CAPABILITY_VERSION_3,
-			.pid = 0,
-		};
-
-		struct __user_cap_data_struct payload[_LINUX_CAPABILITY_U32S_3] = {{ 0 }};
-		uint64_t effective, cap;
-
-		if (capget(&header, payload) < 0)
-			err(EXIT_FAILURE, _("capget failed"));
-
-		/* In order the make capabilities ambient, we first need to ensure
-		 * that they are all inheritable. */
-		payload[0].inheritable = payload[0].permitted;
-		payload[1].inheritable = payload[1].permitted;
-
-		if (capset(&header, payload) < 0)
-			err(EXIT_FAILURE, _("capset failed"));
-
-		effective = ((uint64_t)payload[1].effective << 32) |  (uint64_t)payload[0].effective;
-
-		for (cap = 0; cap < (sizeof(effective) * 8); cap++) {
-			/* This is the same check as cap_valid(), but using
-			 * the runtime value for the last valid cap. */
-			if (cap > (uint64_t) cap_last_cap())
-				continue;
-
-			if ((effective & (1 << cap))
-			    && prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, cap, 0, 0) < 0)
-					err(EXIT_FAILURE, _("prctl(PR_CAP_AMBIENT) failed"));
-                }
-        }
+	if (keepcaps && (unshare_flags & CLONE_NEWUSER))
+		cap_permitted_to_ambient();
 
 	if (optind < argc) {
 		execvp(argv[optind], argv + optind);

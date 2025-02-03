@@ -1,3 +1,14 @@
+/*
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * Copyright (C) 2012 Sami Kerola <kerolasa@iki.fi>
+ * Copyright (C) 2012-2023 Karel Zak <kzak@redhat.com>
+ */
 #include <inttypes.h>
 
 #include "c.h"
@@ -18,6 +29,8 @@
 
 int ipc_msg_get_limits(struct ipc_limits *lim)
 {
+	memset(lim, 0, sizeof(*lim));
+
 	if (access(_PATH_PROC_IPC_MSGMNI, F_OK) == 0 &&
 	    access(_PATH_PROC_IPC_MSGMNB, F_OK) == 0 &&
 	    access(_PATH_PROC_IPC_MSGMAX, F_OK) == 0) {
@@ -218,7 +231,7 @@ static void get_sem_elements(struct sem_data *p)
 {
 	size_t i;
 
-	if (!p || !p->sem_nsems || p->sem_perm.id < 0)
+	if (!p || !p->sem_nsems || p->sem_nsems > SIZE_MAX || p->sem_perm.id < 0)
 		return;
 
 	p->elements = xcalloc(p->sem_nsems, sizeof(struct sem_elem));
@@ -511,17 +524,17 @@ void ipc_print_size(int unit, char *msg, uint64_t size, const char *end,
 	switch (unit) {
 	case IPC_UNIT_DEFAULT:
 	case IPC_UNIT_BYTES:
-		sprintf(format, "%%%dju", width);
+		snprintf(format, sizeof(format), "%%%dju", width);
 		printf(format, size);
 		break;
 	case IPC_UNIT_KB:
-		sprintf(format, "%%%dju", width);
+		snprintf(format, sizeof(format), "%%%dju", width);
 		printf(format, size / 1024);
 		break;
 	case IPC_UNIT_HUMAN:
 	{
 		char *tmp;
-		sprintf(format, "%%%ds", width);
+		snprintf(format, sizeof(format), "%%%ds", width);
 		printf(format, (tmp = size_to_human_string(SIZE_SUFFIX_1LETTER, size)));
 		free(tmp);
 		break;

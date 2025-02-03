@@ -346,7 +346,7 @@ int fdisk_list_disklabel(struct fdisk_context *cxt)
  */
 int fdisk_create_disklabel(struct fdisk_context *cxt, const char *name)
 {
-	int haslabel = 0;
+	int haslabel = 0, rc;
 	struct fdisk_label *lb;
 
 	if (!cxt)
@@ -375,13 +375,19 @@ int fdisk_create_disklabel(struct fdisk_context *cxt, const char *name)
 	if (!lb->op->create)
 		return -ENOSYS;
 
-	__fdisk_switch_label(cxt, lb);
+	rc = __fdisk_switch_label(cxt, lb);
+	if (rc)
+		return rc;
+
 	assert(cxt->label == lb);
 
-	if (haslabel && !cxt->parent)
-		fdisk_reset_device_properties(cxt);
+	if (haslabel && !cxt->parent) {
+		rc = fdisk_reset_device_properties(cxt);
+		if (rc)
+			return rc;
+	}
 
-	DBG(CXT, ul_debugobj(cxt, "create a new %s label", lb->name));
+	DBG(CXT, ul_debugobj(cxt, "creating a new %s label", lb->name));
 	return lb->op->create(cxt);
 }
 
@@ -583,12 +589,28 @@ int fdisk_toggle_partition_flag(struct fdisk_context *cxt,
  */
 int fdisk_reorder_partitions(struct fdisk_context *cxt)
 {
+	int rc;
+
 	if (!cxt || !cxt->label)
 		return -EINVAL;
 	if (!cxt->label->op->reorder)
 		return -ENOSYS;
 
-	return cxt->label->op->reorder(cxt);
+	rc = cxt->label->op->reorder(cxt);
+
+	switch (rc) {
+	case 0:
+		fdisk_info(cxt, _("Partitions order fixed."));
+		break;
+	case 1:
+		fdisk_info(cxt, _("Nothing to do. Ordering is correct already."));
+		break;
+	default:
+		fdisk_warnx(cxt, _("Failed to fix partitions order."));
+		break;
+	}
+
+	return rc;
 }
 
 /*

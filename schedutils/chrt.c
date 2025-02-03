@@ -33,7 +33,7 @@
 #include "nls.h"
 #include "closestream.h"
 #include "strutils.h"
-#include "procutils.h"
+#include "procfs.h"
 #include "sched_attr.h"
 
 
@@ -90,9 +90,9 @@ static void __attribute__((__noreturn__)) usage(void)
 	fputs(_(" -v, --verbose        display status information\n"), out);
 
 	fputs(USAGE_SEPARATOR, out);
-	printf(USAGE_HELP_OPTIONS(22));
+	fprintf(out, USAGE_HELP_OPTIONS(22));
 
-	printf(USAGE_MAN_TAIL("chrt(1)"));
+	fprintf(out, USAGE_MAN_TAIL("chrt(1)"));
 	exit(EXIT_SUCCESS);
 }
 
@@ -215,16 +215,14 @@ static void show_sched_info(struct chrt_ctl *ctl)
 {
 	if (ctl->all_tasks) {
 #ifdef __linux__
+		DIR *sub = NULL;
 		pid_t tid;
-		struct proc_tasks *ts = proc_open_tasks(ctl->pid);
+		struct path_cxt *pc = ul_new_procfs_path(ctl->pid, NULL);
 
-		if (!ts)
-			err(EXIT_FAILURE, _("cannot obtain the list of tasks"));
-
-		while (!proc_next_tid(ts, &tid))
+		while (pc && procfs_process_next_tid(pc, &sub, &tid) == 0)
 			show_sched_pid_info(ctl, tid);
 
-		proc_close_tasks(ts);
+		ul_unref_path(pc);
 #else
 		err(EXIT_FAILURE, _("cannot obtain the list of tasks"));
 #endif
@@ -301,7 +299,7 @@ static int set_sched_one(struct chrt_ctl *ctl, pid_t pid)
 	if (ctl->policy != SCHED_DEADLINE)
 		return set_sched_one_by_setscheduler(ctl, pid);
 
-	/* no changeed by chrt, follow the current setting */
+	/* not changed by chrt, follow the current setting */
 	sa.sched_nice = getpriority(PRIO_PROCESS, pid);
 
 	/* use main() to check if the setting makes sense */
@@ -325,17 +323,18 @@ static void set_sched(struct chrt_ctl *ctl)
 {
 	if (ctl->all_tasks) {
 #ifdef __linux__
+		DIR *sub = NULL;
 		pid_t tid;
-		struct proc_tasks *ts = proc_open_tasks(ctl->pid);
+		struct path_cxt *pc = ul_new_procfs_path(ctl->pid, NULL);
 
-		if (!ts)
+		if (!pc)
 			err(EXIT_FAILURE, _("cannot obtain the list of tasks"));
 
-		while (!proc_next_tid(ts, &tid))
+		while (procfs_process_next_tid(pc, &sub, &tid) == 0) {
 			if (set_sched_one(ctl, tid) == -1)
 				err(EXIT_FAILURE, _("failed to set tid %d's policy"), tid);
-
-		proc_close_tasks(ts);
+		}
+		ul_unref_path(pc);
 #else
 		err(EXIT_FAILURE, _("cannot obtain the list of tasks"));
 #endif
@@ -460,7 +459,7 @@ int main(int argc, char **argv)
 	if (ctl->policy == SCHED_DEADLINE) {
 		/* The basic rule is runtime <= deadline <= period, so we can
 		 * make deadline and runtime optional on command line. Note we
-		 * don't check any values or set any defaults, it's kernel
+		 * don't check any values or set any defaults; it's kernel's
 		 * responsibility.
 		 */
 		if (ctl->deadline == 0)
@@ -486,6 +485,8 @@ int main(int argc, char **argv)
 
 	if (!ctl->pid) {
 		argv += optind + 1;
+		if (strcmp(argv[0], "--") == 0)
+			argv++;
 		execvp(argv[0], argv);
 		errexec(argv[0]);
 	}
